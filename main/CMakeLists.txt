@@ -1,3 +1,3 @@
 idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS "."
-                    PRIV_REQUIRES esp_adc rh_sensor driver)
+                       INCLUDE_DIRS ""
+                       REQUIRES rh_sensor rll400)
