@@ -4,7 +4,6 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -13,7 +12,7 @@ typedef struct {
   // I2C / ADS1115 definition
   i2c_port_t i2c_port;
   uint8_t ads_addr;
-  uint8_t ads_channel;      // Channel connected to 4-20mA signal
+  // ads_channel removed as we use hardcoded differential pair A2-A3
   float shunt_resistor_ohm; // Resistor value (e.g., 109.3)
 
   // Motor Control GPIOs

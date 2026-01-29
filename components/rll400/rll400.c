@@ -6,7 +6,6 @@
 #include <math.h>
 #include <string.h>
 
-
 static const char *TAG = "rll400";
 
 typedef struct rll400_context_t {
@@ -86,10 +85,10 @@ esp_err_t rll400_get_status(rll400_handle_t handle, float *out_position_percent,
   rll400_context_t *ctx = handle;
 
   float voltage_mv = 0;
-  ESP_RETURN_ON_ERROR(ads1115_read_voltage(ctx->ads_handle,
-                                           ctx->config.ads_channel,
-                                           &voltage_mv),
-                      TAG, "Read ADC failed");
+  // A2-A3 Differential
+  ESP_RETURN_ON_ERROR(
+      ads1115_read_voltage_differential(ctx->ads_handle, 2, 3, &voltage_mv),
+      TAG, "Read ADC failed (Diff A2-A3)");
 
   // I = U / R
   // mA = mV / Ohm

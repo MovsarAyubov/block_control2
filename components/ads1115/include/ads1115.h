@@ -42,6 +42,19 @@ esp_err_t ads1115_read_voltage(ads1115_handle_t handle, int channel,
                                float *out_voltage_mv);
 
 /**
+ * @brief Read voltage from differential channels
+ *
+ * @param handle Driver handle
+ * @param channel_pos Positive channel (e.g. 0)
+ * @param channel_neg Negative channel (e.g. 1)
+ * @param out_voltage_mv Pointer to store result in mV
+ * @return esp_err_t
+ */
+esp_err_t ads1115_read_voltage_differential(ads1115_handle_t handle,
+                                            int channel_pos, int channel_neg,
+                                            float *out_voltage_mv);
+
+/**
  * @brief Free resources
  *
  * @param handle Driver handle

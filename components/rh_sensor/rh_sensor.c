@@ -54,12 +54,12 @@ esp_err_t rh_sensor_read(rh_sensor_handle_t handle, float *out_pin_mv,
   ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
   rh_sensor_ctx_t *ctx = handle;
 
-  // 1. Read Voltage (mV) using shared driver
+  // 1. Read Voltage (mV) using shared driver (Differential A0-A1)
   float voltage_mv = 0;
-  ESP_RETURN_ON_ERROR(ads1115_read_voltage(ctx->ads_handle,
-                                           ctx->config.ads_channel,
-                                           &voltage_mv),
-                      TAG, "Failed to read voltage");
+  // A0-A1 Differential
+  ESP_RETURN_ON_ERROR(
+      ads1115_read_voltage_differential(ctx->ads_handle, 0, 1, &voltage_mv),
+      TAG, "Failed to read voltage (Diff A0-A1)");
 
   // Apply Offset
   voltage_mv += ctx->config.offset_mv;
