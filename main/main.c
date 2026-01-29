@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "rh_sensor.h"
+#include "rll400.h"
 #include <stdio.h>
 
 static const char *TAG = "APP";
@@ -15,10 +16,15 @@ static const char *TAG = "APP";
 #define I2C_MASTER_TX_BUF_DISABLE 0
 #define I2C_MASTER_RX_BUF_DISABLE 0
 
-// User Hardware Setup
+// Sensor Config
 #define R1 5220.0f
 #define R2 10000.0f
-#define ADC_OFFSET_MV 0 // ADS1115 is usually precise, start with 0 offset
+#define ADC_OFFSET_MV 0
+
+// RLL400 Config
+#define RLL_SHUNT_OHM 109.9f
+#define RLL_PIN_OPEN 18
+#define RLL_PIN_CLOSE 19
 
 static esp_err_t i2c_master_init(void) {
   int i2c_master_port = I2C_MASTER_NUM;
@@ -41,30 +47,47 @@ void app_main(void) {
   ESP_ERROR_CHECK(i2c_master_init());
   ESP_LOGI(TAG, "I2C Initialized");
 
-  // 2. Initialize Sensor (ADS1115)
-  rh_sensor_config_t config = {.i2c_port = I2C_MASTER_NUM,
+  // 2. Initialize RH Sensor
+  rh_sensor_config_t rh_cfg = {.i2c_port = I2C_MASTER_NUM,
                                .i2c_addr = ADS1115_ADDR_GND, // 0x48
-                               .ads_channel = 0,             // AIN0
                                .r1_ohm = R1,
                                .r2_ohm = R2,
                                .offset_mv = ADC_OFFSET_MV};
 
-  rh_sensor_handle_t sensor_handle = NULL;
-  ESP_ERROR_CHECK(rh_sensor_init(&config, &sensor_handle));
+  rh_sensor_handle_t rh_handle = NULL;
+  ESP_ERROR_CHECK(rh_sensor_init(&rh_cfg, &rh_handle));
+  ESP_LOGI(TAG, "RH Sensor Initialized");
 
-  ESP_LOGI(TAG, "Sensor Initialized (ADS1115)");
+  // 3. Initialize RLL400
+  rll400_config_t rll_cfg = {.i2c_port = I2C_MASTER_NUM,
+                             .ads_addr = ADS1115_ADDR_GND,
+                             .shunt_resistor_ohm = RLL_SHUNT_OHM,
+                             .pin_open = RLL_PIN_OPEN,
+                             .pin_close = RLL_PIN_CLOSE,
+                             .hysteresis_percent = 2.0f};
+
+  rll400_handle_t rll_handle = NULL;
+  ESP_ERROR_CHECK(rll400_init(&rll_cfg, &rll_handle));
+  ESP_LOGI(TAG, "RLL400 Initialized");
+
+  // Demo: Set target to 50%
+  rll400_set_target(rll_handle, 50.0f);
 
   while (1) {
+    // Read RH
     float pin_mv, u_sensor, rh;
-
-    // 3. Read Sensor
-    esp_err_t err = rh_sensor_read(sensor_handle, &pin_mv, &u_sensor, &rh);
-
-    if (err == ESP_OK) {
-      ESP_LOGI(TAG, "V_ads: %.0f mV | U_sensor: %.3f V | RH: %.1f %%", pin_mv,
-               u_sensor, rh);
+    if (rh_sensor_read(rh_handle, &pin_mv, &u_sensor, &rh) == ESP_OK) {
+      ESP_LOGI(TAG, "RH Sensor -> V_ads: %.0f mV | RH: %.1f %%", pin_mv, rh);
     } else {
-      ESP_LOGE(TAG, "Failed to read sensor (Check wiring/I2C)");
+      ESP_LOGE(TAG, "Failed to read RH sensor");
+    }
+
+    // Process RLL400 Control Loop
+    rll400_process(rll_handle);
+
+    float pos_pct, current_ma;
+    if (rll400_get_status(rll_handle, &pos_pct, &current_ma) == ESP_OK) {
+      ESP_LOGI(TAG, "RLL400 -> Pos: %.1f %% | I: %.2f mA", pos_pct, current_ma);
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));

@@ -3,7 +3,6 @@
 #include "driver/i2c.h"
 #include "esp_err.h"
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -17,7 +16,6 @@ extern "C" {
 typedef struct {
   i2c_port_t i2c_port; /*!< I2C Port Number */
   uint8_t i2c_addr;    /*!< ADS1115 Address (e.g. 0x48) */
-  uint8_t ads_channel; /*!< ADS1115 Channel (e.g., 0 for AIN0) */
   float r1_ohm;        /*!< Upper divider resistor */
   float r2_ohm;        /*!< Lower divider resistor */
   int offset_mv;       /*!< Calibration offset in mV */
