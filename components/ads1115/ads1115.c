@@ -25,6 +25,8 @@ typedef struct ads1115_context_t {
 
 static esp_err_t _write_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
                             uint16_t value) {
+  // ESP_LOGD(TAG, "Write Reg: Addr 0x%02X, Reg 0x%02X, Val 0x%04X", addr, reg,
+  // value);
   i2c_cmd_handle_t cmd = i2c_cmd_link_create();
   i2c_master_start(cmd);
   i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
@@ -32,13 +34,18 @@ static esp_err_t _write_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
   i2c_master_write_byte(cmd, (value >> 8) & 0xFF, true);
   i2c_master_write_byte(cmd, value & 0xFF, true);
   i2c_master_stop(cmd);
-  esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(100));
+  // Increased timeout to 500ms
+  esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(500));
   i2c_cmd_link_delete(cmd);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "I2C Write Failed: %s", esp_err_to_name(ret));
+  }
   return ret;
 }
 
 static esp_err_t _read_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
                            int16_t *val) {
+  // ESP_LOGD(TAG, "Read Reg: Addr 0x%02X, Reg 0x%02X", addr, reg);
   i2c_cmd_handle_t cmd = i2c_cmd_link_create();
   i2c_master_start(cmd);
   i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
@@ -52,11 +59,14 @@ static esp_err_t _read_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
   i2c_master_read_byte(cmd, &lsb, I2C_MASTER_NACK);
   i2c_master_stop(cmd);
 
-  esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(100));
+  // Increased timeout to 500ms
+  esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(500));
   i2c_cmd_link_delete(cmd);
 
   if (ret == ESP_OK) {
     *val = (int16_t)((msb << 8) | lsb);
+  } else {
+    ESP_LOGE(TAG, "I2C Read Failed: %s", esp_err_to_name(ret));
   }
   return ret;
 }
