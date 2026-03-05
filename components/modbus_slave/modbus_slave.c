@@ -30,6 +30,7 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_HEARTBEAT_TIMEOUT_MS 30000U
 #define MODBUS_CYCLE_TASK_PERIOD_MS 100U
 #define MODBUS_SOLAR_DEFAULT_THRESHOLD_X10 8000U
+#define MODBUS_RTC_SYNC_THRESHOLD_MIN 3U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -92,6 +93,28 @@ static volatile uint32_t s_last_master_seen_ms = 0;
 static volatile uint16_t s_good_cycle_streak = 0;
 static volatile modbus_apply_status_t s_last_apply_status = MODBUS_APPLY_OK;
 
+static volatile uint16_t s_rtc_last_token = 0;
+static volatile uint16_t s_rtc_pending_token = 0;
+static volatile uint16_t s_rtc_pending_hour = 0;
+static volatile uint16_t s_rtc_pending_minute = 0;
+static volatile bool s_rtc_sync_pending = false;
+static uint16_t s_rtc_observed_hour = UINT16_MAX;
+static uint16_t s_rtc_observed_minute = UINT16_MAX;
+static uint16_t s_rtc_observed_token = UINT16_MAX;
+static bool s_hreg_window_inited = false;
+static uint16_t s_hreg_window_snapshot[9] = {0}; // [138..146]
+
+static volatile uint32_t s_rtc_sync_applied_count = 0;
+static volatile uint32_t s_rtc_sync_noop_count = 0;
+static volatile uint32_t s_rtc_sync_fail_count = 0;
+static volatile uint32_t s_rtc_sync_reject_count = 0;
+static volatile modbus_rtc_set_result_t s_rtc_sync_last_result =
+    MODBUS_RTC_SET_RESULT_NONE;
+
+static modbus_rtc_get_time_cb_t s_rtc_get_time_cb = NULL;
+static modbus_rtc_set_time_cb_t s_rtc_set_time_cb = NULL;
+static void *s_rtc_cb_ctx = NULL;
+
 static uint8_t s_slave_id = MODBUS_DEFAULT_SLAVE_ID;
 static remote_ctrl_cfg_t s_remote_active_cfg = {0};
 
@@ -129,6 +152,12 @@ static mb_exception_t modbus_fc_11_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf);
 static mb_exception_t modbus_fc_17_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf);
+
+static void queue_rtc_sync_request_from_regs(void);
+static bool get_local_time_snapshot(uint8_t *hour, uint8_t *minute,
+                                    uint8_t *second);
+static void finalize_rtc_sync(uint16_t token, modbus_rtc_set_result_t result);
+static void process_pending_rtc_sync(void);
 
 static modbus_handler_wrap_t s_handler_wraps[MODBUS_FC_COUNT] = {
     {.fc = 0x01, .original = NULL, .wrapper = modbus_fc_01_wrapper},
@@ -429,6 +458,8 @@ static void update_diag_regs_locked(void) {
 
 static void update_master_seen_and_streak(bool success_cycle) {
   uint32_t t = now_ms();
+  bool mode_switched = false;
+  uint16_t streak_snapshot = 0;
 
   taskENTER_CRITICAL(&s_state_lock);
   s_last_master_seen_ms = t;
@@ -444,10 +475,238 @@ static void update_master_seen_and_streak(bool success_cycle) {
   if (s_mode_state == MODBUS_MODE_AUTONOMOUS && s_good_cycle_streak >= 3U) {
     s_mode_state = MODBUS_MODE_REMOTE;
     s_mode_reason = MODBUS_REASON_NONE;
-    ESP_LOGI(TAG, "Mode changed: AUTONOMOUS -> REMOTE (good_cycle_streak=%u)",
-             (unsigned)s_good_cycle_streak);
+    mode_switched = true;
+    streak_snapshot = s_good_cycle_streak;
   }
   taskEXIT_CRITICAL(&s_state_lock);
+
+  if (mode_switched) {
+    ESP_LOGI(TAG, "Mode changed: AUTONOMOUS -> REMOTE (good_cycle_streak=%u)",
+             (unsigned)streak_snapshot);
+  }
+}
+
+static void queue_rtc_sync_request_from_regs(void) {
+  if (s_mbc_slave_handler == NULL) {
+    return;
+  }
+
+  uint16_t token = 0;
+  uint16_t hour = 0;
+  uint16_t minute = 0;
+  uint16_t applied_token = 0;
+  uint16_t result = 0;
+
+  if (!s_hreg_window_inited) {
+    for (int i = 0; i < 9; ++i) {
+      s_hreg_window_snapshot[i] = s_holding_regs[138 + i];
+    }
+    s_hreg_window_inited = true;
+  } else {
+    for (int i = 0; i < 9; ++i) {
+      uint16_t reg_addr = (uint16_t)(138 + i);
+      uint16_t new_val = s_holding_regs[reg_addr];
+      uint16_t old_val = s_hreg_window_snapshot[i];
+      if (new_val != old_val) {
+        ESP_LOGI(TAG, "HREG[%u] changed: %u -> %u", (unsigned)reg_addr,
+                 (unsigned)old_val, (unsigned)new_val);
+        s_hreg_window_snapshot[i] = new_val;
+      }
+    }
+  }
+
+  token = s_holding_regs[MODBUS_HREG_RTC_SET_TOKEN];
+  hour = s_holding_regs[MODBUS_HREG_RTC_SET_HOUR];
+  minute = s_holding_regs[MODBUS_HREG_RTC_SET_MINUTE];
+  applied_token = s_holding_regs[MODBUS_HREG_RTC_SET_APPLIED_TOKEN];
+  result = s_holding_regs[MODBUS_HREG_RTC_SET_RESULT];
+
+  if (hour != s_rtc_observed_hour || minute != s_rtc_observed_minute ||
+      token != s_rtc_observed_token) {
+    s_rtc_observed_hour = hour;
+    s_rtc_observed_minute = minute;
+    s_rtc_observed_token = token;
+    ESP_LOGI(TAG, "RTC regs changed: 140=%u 141=%u 142=%u 143=%u 144=%u",
+             (unsigned)hour, (unsigned)minute, (unsigned)token,
+             (unsigned)applied_token, (unsigned)result);
+  }
+
+  if (token == 0U) {
+    return;
+  }
+
+  bool queued = false;
+  taskENTER_CRITICAL(&s_state_lock);
+  bool same_as_last = (token == s_rtc_last_token);
+  bool same_as_pending = (s_rtc_sync_pending && token == s_rtc_pending_token);
+  if (!same_as_last && !same_as_pending) {
+    s_rtc_pending_token = token;
+    s_rtc_pending_hour = hour;
+    s_rtc_pending_minute = minute;
+    s_rtc_sync_pending = true;
+    queued = true;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (queued) {
+    ESP_LOGI(TAG, "RTC sync request queued: token=%u target=%02u:%02u",
+             (unsigned)token, (unsigned)hour, (unsigned)minute);
+  }
+}
+
+static bool get_local_time_snapshot(uint8_t *hour, uint8_t *minute,
+                                    uint8_t *second) {
+  if (hour == NULL || minute == NULL || second == NULL) {
+    return false;
+  }
+
+  modbus_rtc_get_time_cb_t rtc_get_cb = NULL;
+  void *rtc_ctx = NULL;
+  taskENTER_CRITICAL(&s_state_lock);
+  rtc_get_cb = s_rtc_get_time_cb;
+  rtc_ctx = s_rtc_cb_ctx;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  uint8_t h = 0;
+  uint8_t m = 0;
+  uint8_t s = 0;
+
+  if (rtc_get_cb != NULL && rtc_get_cb(&h, &m, &s, rtc_ctx) && h <= 23U &&
+      m <= 59U && s <= 59U) {
+    *hour = h;
+    *minute = m;
+    *second = s;
+    return true;
+  }
+
+  return false;
+}
+
+static void finalize_rtc_sync(uint16_t token, modbus_rtc_set_result_t result) {
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    s_holding_regs[MODBUS_HREG_RTC_SET_APPLIED_TOKEN] = token;
+    s_holding_regs[MODBUS_HREG_RTC_SET_RESULT] = (uint16_t)result;
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  }
+
+  uint32_t applied_count = 0;
+  uint32_t noop_count = 0;
+  uint32_t fail_count = 0;
+  uint32_t reject_count = 0;
+
+  taskENTER_CRITICAL(&s_state_lock);
+  s_rtc_last_token = token;
+  s_rtc_sync_pending = false;
+  s_rtc_pending_token = 0;
+  s_rtc_pending_hour = 0;
+  s_rtc_pending_minute = 0;
+  s_rtc_sync_last_result = result;
+
+  if (result == MODBUS_RTC_SET_RESULT_APPLIED &&
+      s_rtc_sync_applied_count < UINT32_MAX) {
+    s_rtc_sync_applied_count++;
+  } else if (result == MODBUS_RTC_SET_RESULT_NOOP &&
+             s_rtc_sync_noop_count < UINT32_MAX) {
+    s_rtc_sync_noop_count++;
+  } else if (result == MODBUS_RTC_SET_RESULT_FAILED &&
+             s_rtc_sync_fail_count < UINT32_MAX) {
+    s_rtc_sync_fail_count++;
+  } else if (result == MODBUS_RTC_SET_RESULT_REJECT_RANGE &&
+             s_rtc_sync_reject_count < UINT32_MAX) {
+    s_rtc_sync_reject_count++;
+  }
+
+  applied_count = s_rtc_sync_applied_count;
+  noop_count = s_rtc_sync_noop_count;
+  fail_count = s_rtc_sync_fail_count;
+  reject_count = s_rtc_sync_reject_count;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  ESP_LOGI(TAG,
+           "RTC sync token=%u result=%u (applied=%lu noop=%lu fail=%lu "
+           "reject=%lu)",
+           (unsigned)token, (unsigned)result, (unsigned long)applied_count,
+           (unsigned long)noop_count, (unsigned long)fail_count,
+           (unsigned long)reject_count);
+
+  // If a newer token was written while current token was in progress, queue it.
+  queue_rtc_sync_request_from_regs();
+}
+
+static void process_pending_rtc_sync(void) {
+  bool pending = false;
+  uint16_t token = 0;
+  uint16_t server_hour = 0;
+  uint16_t server_minute = 0;
+
+  taskENTER_CRITICAL(&s_state_lock);
+  pending = s_rtc_sync_pending;
+  if (pending) {
+    token = s_rtc_pending_token;
+    server_hour = s_rtc_pending_hour;
+    server_minute = s_rtc_pending_minute;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (!pending) {
+    return;
+  }
+
+  bool callbacks_ready = false;
+  taskENTER_CRITICAL(&s_state_lock);
+  callbacks_ready =
+      (s_rtc_get_time_cb != NULL) && (s_rtc_set_time_cb != NULL);
+  taskEXIT_CRITICAL(&s_state_lock);
+  if (!callbacks_ready) {
+    // RTC layer is not bound yet; keep pending request and retry next cycle.
+    return;
+  }
+
+  if (server_hour > 23U || server_minute > 59U) {
+    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_REJECT_RANGE);
+    return;
+  }
+
+  uint8_t local_hour = 0;
+  uint8_t local_minute = 0;
+  uint8_t local_second = 0;
+  if (!get_local_time_snapshot(&local_hour, &local_minute, &local_second)) {
+    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_FAILED);
+    return;
+  }
+
+  uint16_t server_total_min =
+      (uint16_t)(server_hour * 60U + server_minute);
+  uint16_t local_total_min =
+      (uint16_t)(local_hour * 60U + local_minute);
+  uint16_t direct_diff = (server_total_min >= local_total_min)
+                             ? (uint16_t)(server_total_min - local_total_min)
+                             : (uint16_t)(local_total_min - server_total_min);
+  uint16_t drift_min = (direct_diff <= (uint16_t)(1440U - direct_diff))
+                           ? direct_diff
+                           : (uint16_t)(1440U - direct_diff);
+
+  if (drift_min < MODBUS_RTC_SYNC_THRESHOLD_MIN) {
+    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_NOOP);
+    return;
+  }
+
+  modbus_rtc_set_time_cb_t rtc_set_cb = NULL;
+  void *rtc_ctx = NULL;
+  taskENTER_CRITICAL(&s_state_lock);
+  rtc_set_cb = s_rtc_set_time_cb;
+  rtc_ctx = s_rtc_cb_ctx;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (rtc_set_cb == NULL ||
+      !rtc_set_cb((uint8_t)server_hour, (uint8_t)server_minute, 0U, rtc_ctx)) {
+    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_FAILED);
+    return;
+  }
+
+  modbus_set_light_current_time((uint8_t)server_hour, (uint8_t)server_minute, 0U);
+  finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_APPLIED);
 }
 
 static mb_exception_t invoke_wrapped_handler(uint8_t fc, void *ctx, uint8_t *frame,
@@ -496,7 +755,11 @@ static mb_exception_t modbus_fc_05_wrapper(void *ctx, uint8_t *frame,
 
 static mb_exception_t modbus_fc_06_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf) {
-  return invoke_wrapped_handler(0x06, ctx, frame, len_buf);
+  mb_exception_t ex = invoke_wrapped_handler(0x06, ctx, frame, len_buf);
+  if (ex == 0) {
+    queue_rtc_sync_request_from_regs();
+  }
+  return ex;
 }
 
 static mb_exception_t modbus_fc_0F_wrapper(void *ctx, uint8_t *frame,
@@ -506,7 +769,11 @@ static mb_exception_t modbus_fc_0F_wrapper(void *ctx, uint8_t *frame,
 
 static mb_exception_t modbus_fc_10_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf) {
-  return invoke_wrapped_handler(0x10, ctx, frame, len_buf);
+  mb_exception_t ex = invoke_wrapped_handler(0x10, ctx, frame, len_buf);
+  if (ex == 0) {
+    queue_rtc_sync_request_from_regs();
+  }
+  return ex;
 }
 
 static mb_exception_t modbus_fc_11_wrapper(void *ctx, uint8_t *frame,
@@ -516,14 +783,24 @@ static mb_exception_t modbus_fc_11_wrapper(void *ctx, uint8_t *frame,
 
 static mb_exception_t modbus_fc_17_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf) {
-  return invoke_wrapped_handler(0x17, ctx, frame, len_buf);
+  mb_exception_t ex = invoke_wrapped_handler(0x17, ctx, frame, len_buf);
+  if (ex == 0) {
+    queue_rtc_sync_request_from_regs();
+  }
+  return ex;
 }
 
 static void install_handler_wrappers(void) {
   for (int i = 0; i < MODBUS_FC_COUNT; ++i) {
     mb_fn_handler_fp original = NULL;
     esp_err_t err = mbc_get_handler(s_mbc_slave_handler, s_handler_wraps[i].fc, &original);
-    if (err != ESP_OK || original == NULL) {
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "FC 0x%02X lookup failed: %s", s_handler_wraps[i].fc,
+               esp_err_to_name(err));
+      continue;
+    }
+    if (original == NULL) {
+      ESP_LOGW(TAG, "FC 0x%02X lookup returned NULL handler", s_handler_wraps[i].fc);
       continue;
     }
 
@@ -534,6 +811,8 @@ static void install_handler_wrappers(void) {
       s_handler_wraps[i].original = NULL;
       ESP_LOGW(TAG, "Failed to wrap FC 0x%02X: %s", s_handler_wraps[i].fc,
                esp_err_to_name(err));
+    } else {
+      ESP_LOGI(TAG, "Wrapped FC 0x%02X", s_handler_wraps[i].fc);
     }
   }
 }
@@ -598,6 +877,10 @@ static void modbus_runtime_task(void *arg) {
       vTaskDelay(pdMS_TO_TICKS(MODBUS_CYCLE_TASK_PERIOD_MS));
       continue;
     }
+
+    // Fallback polling path: detect RTC token writes even if FC wrappers were not hit.
+    queue_rtc_sync_request_from_regs();
+    process_pending_rtc_sync();
 
     uint16_t apply_cmd = 0;
     ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
@@ -682,12 +965,27 @@ void modbus_init(void) {
   s_holding_regs[MODBUS_HREG_SOLAR_UPPER_THRESHOLD_X10] =
       MODBUS_SOLAR_DEFAULT_THRESHOLD_X10;
   s_holding_regs[MODBUS_HREG_LIGHT_REDUCTION_ACTIVE] = 0;
+  s_holding_regs[MODBUS_HREG_RTC_SET_HOUR] = 0;
+  s_holding_regs[MODBUS_HREG_RTC_SET_MINUTE] = 0;
+  s_holding_regs[MODBUS_HREG_RTC_SET_TOKEN] = 0;
+  s_holding_regs[MODBUS_HREG_RTC_SET_APPLIED_TOKEN] = 0;
+  s_holding_regs[MODBUS_HREG_RTC_SET_RESULT] = MODBUS_RTC_SET_RESULT_NONE;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_last_master_seen_ms = now_ms();
   s_good_cycle_streak = 0;
   s_mode_state = MODBUS_MODE_REMOTE;
   s_mode_reason = MODBUS_REASON_NONE;
+  s_rtc_last_token = 0;
+  s_rtc_pending_token = 0;
+  s_rtc_pending_hour = 0;
+  s_rtc_pending_minute = 0;
+  s_rtc_sync_pending = false;
+  s_rtc_sync_applied_count = 0;
+  s_rtc_sync_noop_count = 0;
+  s_rtc_sync_fail_count = 0;
+  s_rtc_sync_reject_count = 0;
+  s_rtc_sync_last_result = MODBUS_RTC_SET_RESULT_NONE;
 
   update_diag_regs_locked();
 
@@ -706,6 +1004,15 @@ void modbus_init(void) {
 
   ESP_LOGI(TAG, "Modbus slave initialized (id=%u, UART2, 19200 8N1)",
            (unsigned)s_slave_id);
+}
+
+void modbus_bind_rtc_callbacks(modbus_rtc_get_time_cb_t get_cb,
+                               modbus_rtc_set_time_cb_t set_cb, void *ctx) {
+  taskENTER_CRITICAL(&s_state_lock);
+  s_rtc_get_time_cb = get_cb;
+  s_rtc_set_time_cb = set_cb;
+  s_rtc_cb_ctx = ctx;
+  taskEXIT_CRITICAL(&s_state_lock);
 }
 
 void modbus_set_telemetry(float air_temp, float air_hum, float water_rail,

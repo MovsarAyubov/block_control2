@@ -74,6 +74,40 @@ static bool s_rtc_available = false;
 static volatile float s_pos_pct = 0.0f;
 static volatile float s_current_ma = 0.0f;
 
+static bool modbus_rtc_get_time_cb(uint8_t *hour, uint8_t *minute,
+                                   uint8_t *second, void *ctx) {
+  (void)ctx;
+  if (!s_rtc_available || rtc_handle == NULL || hour == NULL || minute == NULL ||
+      second == NULL) {
+    return false;
+  }
+
+  ds3231_time_t rtc_time = {0};
+  if (ds3231_get_time(rtc_handle, &rtc_time) != ESP_OK) {
+    return false;
+  }
+
+  *hour = rtc_time.hour;
+  *minute = rtc_time.minute;
+  *second = rtc_time.second;
+  return true;
+}
+
+static bool modbus_rtc_set_time_cb(uint8_t hour, uint8_t minute,
+                                   uint8_t second, void *ctx) {
+  (void)ctx;
+  if (!s_rtc_available || rtc_handle == NULL) {
+    return false;
+  }
+
+  ds3231_time_t rtc_time = {
+      .hour = hour,
+      .minute = minute,
+      .second = second,
+  };
+  return ds3231_set_time(rtc_handle, &rtc_time) == ESP_OK;
+}
+
 static esp_err_t i2c_master_init(void) {
   int i2c_master_port = I2C_MASTER_NUM;
   i2c_config_t conf = {
@@ -231,18 +265,27 @@ void app_main(void) {
   esp_err_t rtc_err = ds3231_init(&rtc_cfg, &rtc_handle);
   if (rtc_err == ESP_OK) {
     s_rtc_available = true;
-    ds3231_time_t init_time = {
-        .hour = RTC_INIT_HOUR,
-        .minute = RTC_INIT_MINUTE,
-        .second = RTC_INIT_SECOND,
-    };
-    esp_err_t set_err = ds3231_set_time(rtc_handle, &init_time);
-    if (set_err == ESP_OK) {
-      ESP_LOGI(TAG, "DS3231 RTC initialized and set to %02u:%02u:%02u",
-               RTC_INIT_HOUR, RTC_INIT_MINUTE, RTC_INIT_SECOND);
+    ds3231_time_t current_time = {0};
+    esp_err_t read_err = ds3231_get_time(rtc_handle, &current_time);
+    if (read_err == ESP_OK) {
+      ESP_LOGI(TAG, "DS3231 RTC initialized, keep current time %02u:%02u:%02u",
+               current_time.hour, current_time.minute, current_time.second);
     } else {
-      ESP_LOGW(TAG, "DS3231 initialized, but failed to set init time: %s",
-               esp_err_to_name(set_err));
+      ds3231_time_t init_time = {
+          .hour = RTC_INIT_HOUR,
+          .minute = RTC_INIT_MINUTE,
+          .second = RTC_INIT_SECOND,
+      };
+      esp_err_t set_err = ds3231_set_time(rtc_handle, &init_time);
+      if (set_err == ESP_OK) {
+        ESP_LOGW(TAG,
+                 "DS3231 time invalid/unreadable, set fallback time to %02u:%02u:%02u",
+                 RTC_INIT_HOUR, RTC_INIT_MINUTE, RTC_INIT_SECOND);
+      } else {
+        ESP_LOGW(TAG,
+                 "DS3231 initialized, but failed to read and set fallback time: %s",
+                 esp_err_to_name(set_err));
+      }
     }
   } else {
     s_rtc_available = false;
@@ -250,6 +293,9 @@ void app_main(void) {
     ESP_LOGW(TAG, "DS3231 not available (%s), running with uptime fallback time",
              esp_err_to_name(rtc_err));
   }
+
+  modbus_bind_rtc_callbacks(modbus_rtc_get_time_cb, modbus_rtc_set_time_cb,
+                            NULL);
 
   rh_sensor_config_t rh_cfg = {.i2c_port = I2C_MASTER_NUM,
                                .i2c_addr = ADS1115_ADDR_GND,

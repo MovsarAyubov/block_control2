@@ -67,6 +67,13 @@ extern "C" {
 #define MODBUS_HREG_SOLAR_UPPER_THRESHOLD_X10 135 // upper threshold (RW)
 #define MODBUS_HREG_LIGHT_REDUCTION_ACTIVE 136   // 1 when forced 50% by radiation
 
+// RTC sync command/result registers
+#define MODBUS_HREG_RTC_SET_HOUR 140          // W, 0..23
+#define MODBUS_HREG_RTC_SET_MINUTE 141        // W, 0..59
+#define MODBUS_HREG_RTC_SET_TOKEN 142         // W, non-zero token triggers processing
+#define MODBUS_HREG_RTC_SET_APPLIED_TOKEN 143 // R, last processed token
+#define MODBUS_HREG_RTC_SET_RESULT 144        // R, see modbus_rtc_set_result_t
+
 typedef enum {
   MODBUS_MODE_REMOTE = 0,
   MODBUS_MODE_AUTONOMOUS = 1,
@@ -86,7 +93,22 @@ typedef enum {
   MODBUS_APPLY_ERR_INTERNAL = 5,
 } modbus_apply_status_t;
 
+typedef enum {
+  MODBUS_RTC_SET_RESULT_NONE = 0,
+  MODBUS_RTC_SET_RESULT_APPLIED = 2,
+  MODBUS_RTC_SET_RESULT_REJECT_RANGE = 3,
+  MODBUS_RTC_SET_RESULT_FAILED = 4,
+  MODBUS_RTC_SET_RESULT_NOOP = 5,
+} modbus_rtc_set_result_t;
+
+typedef bool (*modbus_rtc_get_time_cb_t)(uint8_t *hour, uint8_t *minute,
+                                         uint8_t *second, void *ctx);
+typedef bool (*modbus_rtc_set_time_cb_t)(uint8_t hour, uint8_t minute,
+                                         uint8_t second, void *ctx);
+
 void modbus_init(void);
+void modbus_bind_rtc_callbacks(modbus_rtc_get_time_cb_t get_cb,
+                               modbus_rtc_set_time_cb_t set_cb, void *ctx);
 
 void modbus_set_telemetry(float air_temp, float air_hum, float water_rail,
                           float water_grow, float water_undertray,
