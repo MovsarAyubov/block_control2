@@ -35,20 +35,17 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
 #define MODBUS_NVS_KEY_REMOTE_CFG "remote_cfg"
+#define MODBUS_NVS_KEY_LIGHT_STATE "light_state"
+#define MODBUS_LIGHT_STATE_MAGIC 0x4D424C53U // MBLS
 
 #define MODBUS_DEFAULT_SLAVE_ID 1U
 #define MODBUS_MIN_SLAVE_ID 1U
 #define MODBUS_MAX_SLAVE_ID 247U
 
-#define MODBUS_CTRL_REG_FIRST MODBUS_HREG_CTRL_VERSION_HI
-#define MODBUS_CTRL_REG_LAST MODBUS_HREG_SCH3_OFF_HHMM
-#define MODBUS_CTRL_REG_COUNT (MODBUS_CTRL_REG_LAST - MODBUS_CTRL_REG_FIRST + 1)
-
 #define MODBUS_FC_COUNT 10
 
 // APPLY command values
 #define MODBUS_APPLY_CMD_NONE 0
-#define MODBUS_APPLY_CMD_APPLY 1
 
 typedef struct {
   uint16_t enable;
@@ -74,6 +71,15 @@ typedef struct {
 } persisted_remote_cfg_t;
 
 typedef struct {
+  uint32_t magic;
+  uint32_t active_ctrl_version;
+  uint16_t last_applied_token;
+  uint16_t reserved;
+  light_period_cfg_t active_schedule[MODBUS_LIGHT_MAX_PERIODS];
+  uint32_t crc32;
+} persisted_light_state_t;
+
+typedef struct {
   uint8_t fc;
   mb_fn_handler_fp original;
   mb_fn_handler_fp wrapper;
@@ -86,6 +92,7 @@ static uint16_t s_holding_regs[MODBUS_HREG_TOTAL_COUNT] = {0};
 static volatile uint8_t s_light_hour = 0;
 static volatile uint8_t s_light_minute = 0;
 static volatile uint8_t s_light_second = 0;
+static volatile uint32_t s_light_set_ms = 0;
 
 static volatile modbus_mode_state_t s_mode_state = MODBUS_MODE_REMOTE;
 static volatile modbus_mode_reason_t s_mode_reason = MODBUS_REASON_NONE;
@@ -93,16 +100,25 @@ static volatile uint32_t s_last_master_seen_ms = 0;
 static volatile uint16_t s_good_cycle_streak = 0;
 static volatile modbus_apply_status_t s_last_apply_status = MODBUS_APPLY_OK;
 
+static light_period_cfg_t s_staging_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+static light_period_cfg_t s_active_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+static uint32_t s_active_ctrl_version = 0;
+static volatile bool s_apply_pending = false;
+static light_period_cfg_t s_apply_pending_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+static volatile uint32_t s_apply_ok_count = 0;
+static volatile uint32_t s_apply_fail_invalid_count = 0;
+static volatile uint32_t s_apply_fail_busy_count = 0;
+static volatile uint32_t s_apply_fail_internal_count = 0;
+static volatile modbus_apply_status_t s_last_apply_error_code = MODBUS_APPLY_OK;
+static volatile uint32_t s_last_apply_ts_ms = 0;
+static volatile uint8_t s_last_logged_schedule_mask = UINT8_MAX;
+static volatile uint8_t s_last_logged_schedule_mode = UINT8_MAX;
+
 static volatile uint16_t s_rtc_last_token = 0;
 static volatile uint16_t s_rtc_pending_token = 0;
 static volatile uint16_t s_rtc_pending_hour = 0;
 static volatile uint16_t s_rtc_pending_minute = 0;
 static volatile bool s_rtc_sync_pending = false;
-static uint16_t s_rtc_observed_hour = UINT16_MAX;
-static uint16_t s_rtc_observed_minute = UINT16_MAX;
-static uint16_t s_rtc_observed_token = UINT16_MAX;
-static bool s_hreg_window_inited = false;
-static uint16_t s_hreg_window_snapshot[9] = {0}; // [138..146]
 
 static volatile uint32_t s_rtc_sync_applied_count = 0;
 static volatile uint32_t s_rtc_sync_noop_count = 0;
@@ -158,6 +174,22 @@ static bool get_local_time_snapshot(uint8_t *hour, uint8_t *minute,
                                     uint8_t *second);
 static void finalize_rtc_sync(uint16_t token, modbus_rtc_set_result_t result);
 static void process_pending_rtc_sync(void);
+static void queue_apply_request_from_regs(void);
+static void sync_staging_schedule_from_current_regs(void);
+static void queue_apply_request_from_current_regs(void);
+static bool decode_write_holding_span(uint8_t fc, const uint8_t *frame, uint16_t len,
+                                      uint16_t *start_reg, uint16_t *reg_count);
+static bool reg_span_contains(uint16_t start_reg, uint16_t reg_count,
+                              uint16_t target_reg);
+static bool reg_span_intersects(uint16_t start_reg, uint16_t reg_count,
+                                uint16_t first_reg, uint16_t last_reg);
+static uint8_t get_active_schedule_mask(const light_period_cfg_t *periods,
+                                        uint16_t minute_of_day);
+static void log_active_light_schedules_if_changed(
+    const light_period_cfg_t *periods, modbus_mode_state_t mode,
+    uint16_t minute_of_day, uint8_t active_mask);
+static modbus_apply_status_t apply_control_block(
+    const light_period_cfg_t *candidate_schedule);
 
 static modbus_handler_wrap_t s_handler_wraps[MODBUS_FC_COUNT] = {
     {.fc = 0x01, .original = NULL, .wrapper = modbus_fc_01_wrapper},
@@ -183,10 +215,6 @@ static void u32_to_regs(uint32_t value, uint16_t *hi, uint16_t *lo) {
   if (lo) {
     *lo = (uint16_t)(value & 0xFFFFU);
   }
-}
-
-static uint32_t regs_to_u32(uint16_t hi, uint16_t lo) {
-  return ((uint32_t)hi << 16U) | (uint32_t)lo;
 }
 
 static uint16_t float_to_u16_tenths(float value, float min_v, float max_v) {
@@ -239,15 +267,119 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
   return ~crc;
 }
 
-static uint32_t compute_ctrl_crc32(const uint16_t *regs, size_t count) {
-  // CRC32 over little-endian bytes of 16-bit registers.
+static void light_schedule_to_regs(const light_period_cfg_t *periods, uint16_t *regs) {
+  if (!periods || !regs) {
+    return;
+  }
+
+  regs[MODBUS_HREG_SCH0_ENABLE] = periods[0].enable;
+  regs[MODBUS_HREG_SCH0_ON_HHMM] = periods[0].on_hhmm;
+  regs[MODBUS_HREG_SCH0_OFF_HHMM] = periods[0].off_hhmm;
+  regs[MODBUS_HREG_SCH1_ENABLE] = periods[1].enable;
+  regs[MODBUS_HREG_SCH1_ON_HHMM] = periods[1].on_hhmm;
+  regs[MODBUS_HREG_SCH1_OFF_HHMM] = periods[1].off_hhmm;
+  regs[MODBUS_HREG_SCH2_ENABLE] = periods[2].enable;
+  regs[MODBUS_HREG_SCH2_ON_HHMM] = periods[2].on_hhmm;
+  regs[MODBUS_HREG_SCH2_OFF_HHMM] = periods[2].off_hhmm;
+  regs[MODBUS_HREG_SCH3_ENABLE] = periods[3].enable;
+  regs[MODBUS_HREG_SCH3_ON_HHMM] = periods[3].on_hhmm;
+  regs[MODBUS_HREG_SCH3_OFF_HHMM] = periods[3].off_hhmm;
+}
+
+static void regs_to_light_schedule(const uint16_t *regs, light_period_cfg_t *periods) {
+  if (!periods || !regs) {
+    return;
+  }
+
+  periods[0].enable = regs[MODBUS_HREG_SCH0_ENABLE];
+  periods[0].on_hhmm = regs[MODBUS_HREG_SCH0_ON_HHMM];
+  periods[0].off_hhmm = regs[MODBUS_HREG_SCH0_OFF_HHMM];
+  periods[1].enable = regs[MODBUS_HREG_SCH1_ENABLE];
+  periods[1].on_hhmm = regs[MODBUS_HREG_SCH1_ON_HHMM];
+  periods[1].off_hhmm = regs[MODBUS_HREG_SCH1_OFF_HHMM];
+  periods[2].enable = regs[MODBUS_HREG_SCH2_ENABLE];
+  periods[2].on_hhmm = regs[MODBUS_HREG_SCH2_ON_HHMM];
+  periods[2].off_hhmm = regs[MODBUS_HREG_SCH2_OFF_HHMM];
+  periods[3].enable = regs[MODBUS_HREG_SCH3_ENABLE];
+  periods[3].on_hhmm = regs[MODBUS_HREG_SCH3_ON_HHMM];
+  periods[3].off_hhmm = regs[MODBUS_HREG_SCH3_OFF_HHMM];
+}
+
+static bool validate_light_schedule(const light_period_cfg_t *periods) {
+  if (!periods) {
+    return false;
+  }
+
+  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+    if (periods[i].enable > 1U) {
+      return false;
+    }
+    if (!hhmm_valid(periods[i].on_hhmm) || !hhmm_valid(periods[i].off_hhmm)) {
+      return false;
+    }
+    if (periods[i].enable == 1U && periods[i].on_hhmm == periods[i].off_hhmm) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static uint32_t compute_light_state_crc32(
+    uint32_t active_ctrl_version, uint16_t last_applied_token,
+    const light_period_cfg_t *active_schedule) {
   uint32_t crc = 0;
-  for (size_t i = 0; i < count; ++i) {
-    uint8_t bytes[2] = {(uint8_t)(regs[i] & 0xFFU),
-                        (uint8_t)((regs[i] >> 8U) & 0xFFU)};
-    crc = crc32_update(crc, bytes, sizeof(bytes));
+  crc = crc32_update(crc, (const uint8_t *)&active_ctrl_version,
+                     sizeof(active_ctrl_version));
+  crc = crc32_update(crc, (const uint8_t *)&last_applied_token,
+                     sizeof(last_applied_token));
+  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+    uint16_t fields[3] = {active_schedule[i].enable, active_schedule[i].on_hhmm,
+                          active_schedule[i].off_hhmm};
+    crc = crc32_update(crc, (const uint8_t *)fields, sizeof(fields));
   }
   return crc;
+}
+
+static void set_default_light_state(void) {
+  memset(s_staging_schedule, 0, sizeof(s_staging_schedule));
+  memset(s_active_schedule, 0, sizeof(s_active_schedule));
+  memset(s_apply_pending_schedule, 0, sizeof(s_apply_pending_schedule));
+  s_apply_pending = false;
+  s_active_ctrl_version = 0;
+}
+
+static bool persist_light_state(const light_period_cfg_t *active_schedule,
+                                uint32_t active_ctrl_version) {
+  if (active_schedule == NULL) {
+    return false;
+  }
+
+  nvs_handle_t nvs = 0;
+  esp_err_t err = nvs_open(MODBUS_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "NVS open failed while saving light state: %s",
+             esp_err_to_name(err));
+    return false;
+  }
+
+  persisted_light_state_t blob = {0};
+  blob.magic = MODBUS_LIGHT_STATE_MAGIC;
+  blob.active_ctrl_version = active_ctrl_version;
+  blob.last_applied_token = 0U; // legacy field, not used by v2 apply semantics.
+  memcpy(blob.active_schedule, active_schedule, sizeof(blob.active_schedule));
+  blob.crc32 = compute_light_state_crc32(blob.active_ctrl_version,
+                                         blob.last_applied_token,
+                                         blob.active_schedule);
+
+  err = nvs_set_blob(nvs, MODBUS_NVS_KEY_LIGHT_STATE, &blob, sizeof(blob));
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "NVS save light state failed: %s", esp_err_to_name(err));
+  }
+  nvs_close(nvs);
+  return (err == ESP_OK);
 }
 
 static void remote_cfg_to_regs(const remote_ctrl_cfg_t *cfg, uint16_t *regs) {
@@ -283,35 +415,6 @@ static void remote_cfg_to_regs(const remote_ctrl_cfg_t *cfg, uint16_t *regs) {
   regs[MODBUS_HREG_SCH3_OFF_HHMM] = cfg->periods[3].off_hhmm;
 }
 
-static void regs_to_remote_cfg(const uint16_t *regs, remote_ctrl_cfg_t *cfg) {
-  if (!cfg || !regs) {
-    return;
-  }
-
-  cfg->ctrl_version =
-      regs_to_u32(regs[MODBUS_HREG_CTRL_VERSION_HI], regs[MODBUS_HREG_CTRL_VERSION_LO]);
-  cfg->windows_pos_a_target = regs[MODBUS_HREG_WINDOWS_POS_A_TARGET];
-  cfg->windows_pos_b_target = regs[MODBUS_HREG_WINDOWS_POS_B_TARGET];
-  cfg->curtain_pos_target = regs[MODBUS_HREG_CURTAIN_POS_TARGET];
-  cfg->sp_water_rail = regs[MODBUS_HREG_SP_WATER_RAIL];
-  cfg->sp_water_grow = regs[MODBUS_HREG_SP_WATER_GROW];
-  cfg->sp_water_upper = regs[MODBUS_HREG_SP_WATER_UPPER];
-  cfg->sp_water_undertray = regs[MODBUS_HREG_SP_WATER_UNDERTRAY];
-
-  cfg->periods[0].enable = regs[MODBUS_HREG_SCH0_ENABLE];
-  cfg->periods[0].on_hhmm = regs[MODBUS_HREG_SCH0_ON_HHMM];
-  cfg->periods[0].off_hhmm = regs[MODBUS_HREG_SCH0_OFF_HHMM];
-  cfg->periods[1].enable = regs[MODBUS_HREG_SCH1_ENABLE];
-  cfg->periods[1].on_hhmm = regs[MODBUS_HREG_SCH1_ON_HHMM];
-  cfg->periods[1].off_hhmm = regs[MODBUS_HREG_SCH1_OFF_HHMM];
-  cfg->periods[2].enable = regs[MODBUS_HREG_SCH2_ENABLE];
-  cfg->periods[2].on_hhmm = regs[MODBUS_HREG_SCH2_ON_HHMM];
-  cfg->periods[2].off_hhmm = regs[MODBUS_HREG_SCH2_OFF_HHMM];
-  cfg->periods[3].enable = regs[MODBUS_HREG_SCH3_ENABLE];
-  cfg->periods[3].on_hhmm = regs[MODBUS_HREG_SCH3_ON_HHMM];
-  cfg->periods[3].off_hhmm = regs[MODBUS_HREG_SCH3_OFF_HHMM];
-}
-
 static bool validate_remote_cfg(const remote_ctrl_cfg_t *cfg) {
   if (!cfg) {
     return false;
@@ -326,15 +429,6 @@ static bool validate_remote_cfg(const remote_ctrl_cfg_t *cfg) {
   if (cfg->sp_water_rail > 1200U || cfg->sp_water_grow > 1200U ||
       cfg->sp_water_upper > 1200U || cfg->sp_water_undertray > 1200U) {
     return false;
-  }
-
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    if (cfg->periods[i].enable > 1U) {
-      return false;
-    }
-    if (!hhmm_valid(cfg->periods[i].on_hhmm) || !hhmm_valid(cfg->periods[i].off_hhmm)) {
-      return false;
-    }
   }
 
   return true;
@@ -375,6 +469,7 @@ static void load_persisted_settings(void) {
     s_slave_id = MODBUS_DEFAULT_SLAVE_ID;
     s_remote_active_cfg = s_autonomous_cfg;
     s_remote_active_cfg.ctrl_version = 1;
+    set_default_light_state();
     return;
   }
 
@@ -390,6 +485,7 @@ static void load_persisted_settings(void) {
   }
   s_slave_id = slave_id;
 
+  bool need_persist_default_remote = false;
   persisted_remote_cfg_t blob = {0};
   size_t blob_size = sizeof(blob);
   err = nvs_get_blob(nvs, MODBUS_NVS_KEY_REMOTE_CFG, &blob, &blob_size);
@@ -399,61 +495,176 @@ static void load_persisted_settings(void) {
   } else {
     s_remote_active_cfg = s_autonomous_cfg;
     s_remote_active_cfg.ctrl_version = 1;
-    persist_remote_cfg(&s_remote_active_cfg);
+    need_persist_default_remote = true;
+  }
+
+  bool need_persist_default_light = false;
+  persisted_light_state_t light_blob = {0};
+  size_t light_blob_size = sizeof(light_blob);
+  err = nvs_get_blob(nvs, MODBUS_NVS_KEY_LIGHT_STATE, &light_blob, &light_blob_size);
+  if (err == ESP_OK && light_blob_size == sizeof(light_blob) &&
+      light_blob.magic == MODBUS_LIGHT_STATE_MAGIC &&
+      validate_light_schedule(light_blob.active_schedule)) {
+    uint32_t expected_crc =
+        compute_light_state_crc32(light_blob.active_ctrl_version,
+                                  light_blob.last_applied_token,
+                                  light_blob.active_schedule);
+    if (expected_crc == light_blob.crc32) {
+      memcpy(s_active_schedule, light_blob.active_schedule, sizeof(s_active_schedule));
+      memcpy(s_staging_schedule, light_blob.active_schedule, sizeof(s_staging_schedule));
+      s_active_ctrl_version = light_blob.active_ctrl_version;
+    } else {
+      set_default_light_state();
+      need_persist_default_light = true;
+    }
+  } else {
+    set_default_light_state();
+    need_persist_default_light = true;
   }
 
   nvs_close(nvs);
+
+  if (need_persist_default_remote) {
+    persist_remote_cfg(&s_remote_active_cfg);
+  }
+  if (need_persist_default_light) {
+    (void)persist_light_state(s_active_schedule, s_active_ctrl_version);
+  }
 }
 
-static bool is_now_in_periods(const remote_ctrl_cfg_t *cfg, uint16_t minute_of_day) {
-  if (!cfg) {
+static bool is_period_active(const light_period_cfg_t *slot, uint16_t now_minute_of_day) {
+  if (!slot || slot->enable == 0U) {
     return false;
   }
 
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    if (cfg->periods[i].enable == 0U) {
-      continue;
-    }
-
-    uint16_t on_hhmm = cfg->periods[i].on_hhmm;
-    uint16_t off_hhmm = cfg->periods[i].off_hhmm;
-    if (!hhmm_valid(on_hhmm) || !hhmm_valid(off_hhmm)) {
-      continue;
-    }
-
-    uint16_t start = hhmm_to_minutes(on_hhmm);
-    uint16_t end = hhmm_to_minutes(off_hhmm);
-
-    // ON == OFF means 24h ON.
-    if (start == end) {
-      return true;
-    }
-
-    if (start < end) {
-      if (minute_of_day >= start && minute_of_day < end) {
-        return true;
-      }
-    } else {
-      // Through midnight.
-      if (minute_of_day >= start || minute_of_day < end) {
-        return true;
-      }
-    }
+  if (!hhmm_valid(slot->on_hhmm) || !hhmm_valid(slot->off_hhmm)) {
+    return false;
   }
 
-  return false;
+  uint16_t start = hhmm_to_minutes(slot->on_hhmm);
+  uint16_t end = hhmm_to_minutes(slot->off_hhmm);
+  if (start == end) {
+    return false;
+  }
+
+  if (start < end) {
+    return (now_minute_of_day >= start) && (now_minute_of_day < end);
+  }
+
+  // Through midnight.
+  return (now_minute_of_day >= start) || (now_minute_of_day < end);
+}
+
+static uint8_t get_active_schedule_mask(const light_period_cfg_t *periods,
+                                        uint16_t minute_of_day) {
+  if (!periods) {
+    return 0U;
+  }
+
+  uint8_t active_mask = 0U;
+  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+    if (is_period_active(&periods[i], minute_of_day)) {
+      active_mask |= (uint8_t)(1U << i);
+    }
+  }
+  return active_mask;
+}
+
+static void log_active_light_schedules_if_changed(
+    const light_period_cfg_t *periods, modbus_mode_state_t mode,
+    uint16_t minute_of_day, uint8_t active_mask) {
+  if (periods == NULL || minute_of_day >= 1440U) {
+    return;
+  }
+
+  bool should_log = false;
+  taskENTER_CRITICAL(&s_state_lock);
+  if (s_last_logged_schedule_mask != active_mask ||
+      s_last_logged_schedule_mode != (uint8_t)mode) {
+    s_last_logged_schedule_mask = active_mask;
+    s_last_logged_schedule_mode = (uint8_t)mode;
+    should_log = true;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (!should_log) {
+    return;
+  }
+
+  uint16_t hh = (uint16_t)(minute_of_day / 60U);
+  uint16_t mm = (uint16_t)(minute_of_day % 60U);
+  ESP_LOGI(TAG, "Light schedules active: mode=%s now=%02u:%02u mask=0x%02X",
+           (mode == MODBUS_MODE_AUTONOMOUS) ? "AUTONOMOUS" : "REMOTE",
+           (unsigned)hh, (unsigned)mm, (unsigned)active_mask);
+  if (active_mask == 0U) {
+    return;
+  }
+
+  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+    if ((active_mask & (uint8_t)(1U << i)) != 0U) {
+      ESP_LOGI(TAG, "Light schedule slot %d active: %04u..%04u", i,
+               (unsigned)periods[i].on_hhmm, (unsigned)periods[i].off_hhmm);
+    }
+  }
 }
 
 static void update_diag_regs_locked(void) {
-  s_holding_regs[MODBUS_HREG_MODE_STATE] = (uint16_t)s_mode_state;
-  s_holding_regs[MODBUS_HREG_MODE_REASON] = (uint16_t)s_mode_reason;
+  modbus_mode_state_t mode = MODBUS_MODE_REMOTE;
+  modbus_mode_reason_t reason = MODBUS_REASON_NONE;
+  uint32_t last_master_seen_ms = 0;
+  uint16_t good_cycle_streak = 0;
+  modbus_apply_status_t last_apply_status = MODBUS_APPLY_OK;
+  uint32_t apply_ok_count = 0;
+  uint32_t apply_fail_invalid_count = 0;
+  uint32_t apply_fail_busy_count = 0;
+  uint32_t apply_fail_internal_count = 0;
+  modbus_apply_status_t last_apply_error_code = MODBUS_APPLY_OK;
+  uint32_t last_apply_ts_ms = 0;
+
+  mode = s_mode_state;
+  reason = s_mode_reason;
+  last_master_seen_ms = s_last_master_seen_ms;
+  good_cycle_streak = s_good_cycle_streak;
+  last_apply_status = s_last_apply_status;
+  apply_ok_count = s_apply_ok_count;
+  apply_fail_invalid_count = s_apply_fail_invalid_count;
+  apply_fail_busy_count = s_apply_fail_busy_count;
+  apply_fail_internal_count = s_apply_fail_internal_count;
+  last_apply_error_code = s_last_apply_error_code;
+  last_apply_ts_ms = s_last_apply_ts_ms;
+
+  s_holding_regs[MODBUS_HREG_MODE_STATE] = (uint16_t)mode;
+  s_holding_regs[MODBUS_HREG_MODE_REASON] = (uint16_t)reason;
   s_holding_regs[MODBUS_HREG_LAST_MASTER_SEEN_MS_LO] =
-      (uint16_t)(s_last_master_seen_ms & 0xFFFFU);
+      (uint16_t)(last_master_seen_ms & 0xFFFFU);
   s_holding_regs[MODBUS_HREG_LAST_MASTER_SEEN_MS_HI] =
-      (uint16_t)((s_last_master_seen_ms >> 16U) & 0xFFFFU);
-  s_holding_regs[MODBUS_HREG_GOOD_CYCLE_STREAK] = s_good_cycle_streak;
-  s_holding_regs[MODBUS_HREG_LAST_APPLY_STATUS] = (uint16_t)s_last_apply_status;
-  s_holding_regs[MODBUS_HREG_APPLY_STATUS] = (uint16_t)s_last_apply_status;
+      (uint16_t)((last_master_seen_ms >> 16U) & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_GOOD_CYCLE_STREAK] = good_cycle_streak;
+  s_holding_regs[MODBUS_HREG_LAST_APPLY_STATUS] = (uint16_t)last_apply_status;
+  s_holding_regs[MODBUS_HREG_APPLY_STATUS] = (uint16_t)last_apply_status;
+
+  s_holding_regs[MODBUS_HREG_APPLY_OK_COUNT_HI] =
+      (uint16_t)((apply_ok_count >> 16U) & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_OK_COUNT_LO] =
+      (uint16_t)(apply_ok_count & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_FAIL_INVALID_COUNT_HI] =
+      (uint16_t)((apply_fail_invalid_count >> 16U) & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_FAIL_INVALID_COUNT_LO] =
+      (uint16_t)(apply_fail_invalid_count & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_FAIL_BUSY_COUNT_HI] =
+      (uint16_t)((apply_fail_busy_count >> 16U) & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_FAIL_BUSY_COUNT_LO] =
+      (uint16_t)(apply_fail_busy_count & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_FAIL_INTERNAL_COUNT_HI] =
+      (uint16_t)((apply_fail_internal_count >> 16U) & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_APPLY_FAIL_INTERNAL_COUNT_LO] =
+      (uint16_t)(apply_fail_internal_count & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_LAST_APPLY_ERROR_CODE] =
+      (uint16_t)last_apply_error_code;
+  s_holding_regs[MODBUS_HREG_LAST_APPLY_TS_MS_HI] =
+      (uint16_t)((last_apply_ts_ms >> 16U) & 0xFFFFU);
+  s_holding_regs[MODBUS_HREG_LAST_APPLY_TS_MS_LO] =
+      (uint16_t)(last_apply_ts_ms & 0xFFFFU);
 }
 
 static void update_master_seen_and_streak(bool success_cycle) {
@@ -483,6 +694,7 @@ static void update_master_seen_and_streak(bool success_cycle) {
   if (mode_switched) {
     ESP_LOGI(TAG, "Mode changed: AUTONOMOUS -> REMOTE (good_cycle_streak=%u)",
              (unsigned)streak_snapshot);
+    modbus_get_light_relay_state(NULL, NULL);
   }
 }
 
@@ -494,48 +706,15 @@ static void queue_rtc_sync_request_from_regs(void) {
   uint16_t token = 0;
   uint16_t hour = 0;
   uint16_t minute = 0;
-  uint16_t applied_token = 0;
-  uint16_t result = 0;
-
-  if (!s_hreg_window_inited) {
-    for (int i = 0; i < 9; ++i) {
-      s_hreg_window_snapshot[i] = s_holding_regs[138 + i];
-    }
-    s_hreg_window_inited = true;
-  } else {
-    for (int i = 0; i < 9; ++i) {
-      uint16_t reg_addr = (uint16_t)(138 + i);
-      uint16_t new_val = s_holding_regs[reg_addr];
-      uint16_t old_val = s_hreg_window_snapshot[i];
-      if (new_val != old_val) {
-        ESP_LOGI(TAG, "HREG[%u] changed: %u -> %u", (unsigned)reg_addr,
-                 (unsigned)old_val, (unsigned)new_val);
-        s_hreg_window_snapshot[i] = new_val;
-      }
-    }
-  }
 
   token = s_holding_regs[MODBUS_HREG_RTC_SET_TOKEN];
   hour = s_holding_regs[MODBUS_HREG_RTC_SET_HOUR];
   minute = s_holding_regs[MODBUS_HREG_RTC_SET_MINUTE];
-  applied_token = s_holding_regs[MODBUS_HREG_RTC_SET_APPLIED_TOKEN];
-  result = s_holding_regs[MODBUS_HREG_RTC_SET_RESULT];
-
-  if (hour != s_rtc_observed_hour || minute != s_rtc_observed_minute ||
-      token != s_rtc_observed_token) {
-    s_rtc_observed_hour = hour;
-    s_rtc_observed_minute = minute;
-    s_rtc_observed_token = token;
-    ESP_LOGI(TAG, "RTC regs changed: 140=%u 141=%u 142=%u 143=%u 144=%u",
-             (unsigned)hour, (unsigned)minute, (unsigned)token,
-             (unsigned)applied_token, (unsigned)result);
-  }
 
   if (token == 0U) {
     return;
   }
 
-  bool queued = false;
   taskENTER_CRITICAL(&s_state_lock);
   bool same_as_last = (token == s_rtc_last_token);
   bool same_as_pending = (s_rtc_sync_pending && token == s_rtc_pending_token);
@@ -544,14 +723,8 @@ static void queue_rtc_sync_request_from_regs(void) {
     s_rtc_pending_hour = hour;
     s_rtc_pending_minute = minute;
     s_rtc_sync_pending = true;
-    queued = true;
   }
   taskEXIT_CRITICAL(&s_state_lock);
-
-  if (queued) {
-    ESP_LOGI(TAG, "RTC sync request queued: token=%u target=%02u:%02u",
-             (unsigned)token, (unsigned)hour, (unsigned)minute);
-  }
 }
 
 static bool get_local_time_snapshot(uint8_t *hour, uint8_t *minute,
@@ -709,6 +882,100 @@ static void process_pending_rtc_sync(void) {
   finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_APPLIED);
 }
 
+static bool decode_write_holding_span(uint8_t fc, const uint8_t *frame, uint16_t len,
+                                      uint16_t *start_reg, uint16_t *reg_count) {
+  if (frame == NULL || start_reg == NULL || reg_count == NULL) {
+    return false;
+  }
+
+  uint16_t raw_start = 0;
+  uint16_t raw_count = 0;
+  switch (fc) {
+  case 0x06:
+    if (len < 5U) {
+      return false;
+    }
+    raw_start = (uint16_t)(((uint16_t)frame[1] << 8U) | (uint16_t)frame[2]);
+    raw_count = 1U;
+    break;
+  case 0x10:
+    if (len < 6U) {
+      return false;
+    }
+    raw_start = (uint16_t)(((uint16_t)frame[1] << 8U) | (uint16_t)frame[2]);
+    raw_count = (uint16_t)(((uint16_t)frame[3] << 8U) | (uint16_t)frame[4]);
+    break;
+  case 0x17:
+    if (len < 10U) {
+      return false;
+    }
+    raw_start = (uint16_t)(((uint16_t)frame[5] << 8U) | (uint16_t)frame[6]);
+    raw_count = (uint16_t)(((uint16_t)frame[7] << 8U) | (uint16_t)frame[8]);
+    break;
+  default:
+    return false;
+  }
+
+  if (raw_count == 0U) {
+    return false;
+  }
+
+  // Internal register callbacks use one-based addressing, so normalize once.
+  *start_reg = (uint16_t)(raw_start + 1U);
+  *reg_count = raw_count;
+  return true;
+}
+
+static bool reg_span_contains(uint16_t start_reg, uint16_t reg_count,
+                              uint16_t target_reg) {
+  if (reg_count == 0U) {
+    return false;
+  }
+  uint32_t end_reg = (uint32_t)start_reg + (uint32_t)reg_count - 1U;
+  return ((uint32_t)target_reg >= (uint32_t)start_reg) &&
+         ((uint32_t)target_reg <= end_reg);
+}
+
+static bool reg_span_intersects(uint16_t start_reg, uint16_t reg_count,
+                                uint16_t first_reg, uint16_t last_reg) {
+  if (reg_count == 0U || first_reg > last_reg) {
+    return false;
+  }
+  uint32_t end_reg = (uint32_t)start_reg + (uint32_t)reg_count - 1U;
+  if (end_reg < (uint32_t)first_reg) {
+    return false;
+  }
+  if ((uint32_t)start_reg > (uint32_t)last_reg) {
+    return false;
+  }
+  return true;
+}
+
+static void sync_staging_schedule_from_current_regs(void) {
+  light_period_cfg_t staging[MODBUS_LIGHT_MAX_PERIODS] = {0};
+  regs_to_light_schedule(s_holding_regs, staging);
+
+  taskENTER_CRITICAL(&s_state_lock);
+  memcpy(s_staging_schedule, staging, sizeof(s_staging_schedule));
+  taskEXIT_CRITICAL(&s_state_lock);
+}
+
+static void queue_apply_request_from_current_regs(void) {
+  light_period_cfg_t staging[MODBUS_LIGHT_MAX_PERIODS] = {0};
+  regs_to_light_schedule(s_holding_regs, staging);
+  s_holding_regs[MODBUS_HREG_APPLY_CMD] = MODBUS_APPLY_CMD_NONE;
+
+  taskENTER_CRITICAL(&s_state_lock);
+  bool was_pending = s_apply_pending;
+  memcpy(s_staging_schedule, staging, sizeof(s_staging_schedule));
+  memcpy(s_apply_pending_schedule, staging, sizeof(s_apply_pending_schedule));
+  s_apply_pending = true;
+  if (was_pending && s_apply_fail_busy_count < UINT32_MAX) {
+    s_apply_fail_busy_count++;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+}
+
 static mb_exception_t invoke_wrapped_handler(uint8_t fc, void *ctx, uint8_t *frame,
                                              uint16_t *len_buf) {
   mb_fn_handler_fp original = NULL;
@@ -755,9 +1022,30 @@ static mb_exception_t modbus_fc_05_wrapper(void *ctx, uint8_t *frame,
 
 static mb_exception_t modbus_fc_06_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf) {
+  uint16_t start_reg = 0;
+  uint16_t reg_count = 0;
+  uint16_t req_len = (len_buf != NULL) ? *len_buf : 0U;
+  bool has_span = decode_write_holding_span(0x06, frame, req_len, &start_reg, &reg_count);
+  uint16_t alt_start_reg = (start_reg > 0U) ? (uint16_t)(start_reg - 1U) : start_reg;
+  bool writes_schedule =
+      has_span &&
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
+                           MODBUS_HREG_SCH3_OFF_HHMM) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
+                           MODBUS_HREG_SCH3_OFF_HHMM));
+  bool writes_apply =
+      has_span &&
+      (reg_span_contains(start_reg, reg_count, MODBUS_HREG_APPLY_CMD) ||
+       reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_APPLY_CMD));
+
   mb_exception_t ex = invoke_wrapped_handler(0x06, ctx, frame, len_buf);
   if (ex == 0) {
     queue_rtc_sync_request_from_regs();
+    if (writes_apply) {
+      queue_apply_request_from_current_regs();
+    } else if (writes_schedule) {
+      sync_staging_schedule_from_current_regs();
+    }
   }
   return ex;
 }
@@ -769,9 +1057,30 @@ static mb_exception_t modbus_fc_0F_wrapper(void *ctx, uint8_t *frame,
 
 static mb_exception_t modbus_fc_10_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf) {
+  uint16_t start_reg = 0;
+  uint16_t reg_count = 0;
+  uint16_t req_len = (len_buf != NULL) ? *len_buf : 0U;
+  bool has_span = decode_write_holding_span(0x10, frame, req_len, &start_reg, &reg_count);
+  uint16_t alt_start_reg = (start_reg > 0U) ? (uint16_t)(start_reg - 1U) : start_reg;
+  bool writes_schedule =
+      has_span &&
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
+                           MODBUS_HREG_SCH3_OFF_HHMM) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
+                           MODBUS_HREG_SCH3_OFF_HHMM));
+  bool writes_apply =
+      has_span &&
+      (reg_span_contains(start_reg, reg_count, MODBUS_HREG_APPLY_CMD) ||
+       reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_APPLY_CMD));
+
   mb_exception_t ex = invoke_wrapped_handler(0x10, ctx, frame, len_buf);
   if (ex == 0) {
     queue_rtc_sync_request_from_regs();
+    if (writes_apply) {
+      queue_apply_request_from_current_regs();
+    } else if (writes_schedule) {
+      sync_staging_schedule_from_current_regs();
+    }
   }
   return ex;
 }
@@ -783,9 +1092,30 @@ static mb_exception_t modbus_fc_11_wrapper(void *ctx, uint8_t *frame,
 
 static mb_exception_t modbus_fc_17_wrapper(void *ctx, uint8_t *frame,
                                            uint16_t *len_buf) {
+  uint16_t start_reg = 0;
+  uint16_t reg_count = 0;
+  uint16_t req_len = (len_buf != NULL) ? *len_buf : 0U;
+  bool has_span = decode_write_holding_span(0x17, frame, req_len, &start_reg, &reg_count);
+  uint16_t alt_start_reg = (start_reg > 0U) ? (uint16_t)(start_reg - 1U) : start_reg;
+  bool writes_schedule =
+      has_span &&
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
+                           MODBUS_HREG_SCH3_OFF_HHMM) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
+                           MODBUS_HREG_SCH3_OFF_HHMM));
+  bool writes_apply =
+      has_span &&
+      (reg_span_contains(start_reg, reg_count, MODBUS_HREG_APPLY_CMD) ||
+       reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_APPLY_CMD));
+
   mb_exception_t ex = invoke_wrapped_handler(0x17, ctx, frame, len_buf);
   if (ex == 0) {
     queue_rtc_sync_request_from_regs();
+    if (writes_apply) {
+      queue_apply_request_from_current_regs();
+    } else if (writes_schedule) {
+      sync_staging_schedule_from_current_regs();
+    }
   }
   return ex;
 }
@@ -817,55 +1147,111 @@ static void install_handler_wrappers(void) {
   }
 }
 
-static remote_ctrl_cfg_t get_effective_cfg(void) {
-  remote_ctrl_cfg_t cfg = {0};
+static void queue_apply_request_from_regs(void) {
+  if (s_mbc_slave_handler == NULL) {
+    return;
+  }
+
+  light_period_cfg_t staging[MODBUS_LIGHT_MAX_PERIODS] = {0};
+  uint16_t apply_cmd = MODBUS_APPLY_CMD_NONE;
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  regs_to_light_schedule(s_holding_regs, staging);
+  apply_cmd = s_holding_regs[MODBUS_HREG_APPLY_CMD];
+  if (apply_cmd != MODBUS_APPLY_CMD_NONE) {
+    s_holding_regs[MODBUS_HREG_APPLY_CMD] = MODBUS_APPLY_CMD_NONE;
+  }
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+
   taskENTER_CRITICAL(&s_state_lock);
-  if (s_mode_state == MODBUS_MODE_AUTONOMOUS) {
-    cfg = s_autonomous_cfg;
-  } else {
-    cfg = s_remote_active_cfg;
+  memcpy(s_staging_schedule, staging, sizeof(s_staging_schedule));
+  if (apply_cmd != MODBUS_APPLY_CMD_NONE) {
+    bool was_pending = s_apply_pending;
+    memcpy(s_apply_pending_schedule, staging, sizeof(s_apply_pending_schedule));
+    s_apply_pending = true;
+    if (was_pending && s_apply_fail_busy_count < UINT32_MAX) {
+      s_apply_fail_busy_count++;
+    }
   }
   taskEXIT_CRITICAL(&s_state_lock);
-  return cfg;
 }
 
-static modbus_apply_status_t apply_control_block(void) {
+static void finalize_apply_result(modbus_apply_status_t status) {
+  uint32_t ts = now_ms();
+
+  taskENTER_CRITICAL(&s_state_lock);
+  s_last_apply_status = status;
+  s_last_apply_ts_ms = ts;
+  if (status == MODBUS_APPLY_OK) {
+    s_last_apply_error_code = MODBUS_APPLY_OK;
+    if (s_apply_ok_count < UINT32_MAX) {
+      s_apply_ok_count++;
+    }
+  } else if (status == MODBUS_APPLY_ERR_RANGE || status == MODBUS_APPLY_ERR_CRC ||
+             status == MODBUS_APPLY_ERR_CMD) {
+    s_last_apply_error_code = status;
+    if (s_apply_fail_invalid_count < UINT32_MAX) {
+      s_apply_fail_invalid_count++;
+    }
+  } else if (status == MODBUS_APPLY_ERR_BUSY) {
+    s_last_apply_error_code = status;
+    if (s_apply_fail_busy_count < UINT32_MAX) {
+      s_apply_fail_busy_count++;
+    }
+  } else {
+    s_last_apply_error_code = status;
+    if (s_apply_fail_internal_count < UINT32_MAX) {
+      s_apply_fail_internal_count++;
+    }
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+}
+
+static modbus_apply_status_t apply_control_block(
+    const light_period_cfg_t *candidate_schedule) {
   if (s_mbc_slave_handler == NULL) {
     return MODBUS_APPLY_ERR_INTERNAL;
   }
-
-  uint16_t snapshot[MODBUS_HREG_TOTAL_COUNT] = {0};
-
-  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-  memcpy(snapshot, s_holding_regs, sizeof(snapshot));
-  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
-
-  uint32_t expected_crc =
-      regs_to_u32(snapshot[MODBUS_HREG_CTRL_CRC_HI], snapshot[MODBUS_HREG_CTRL_CRC_LO]);
-  uint32_t actual_crc =
-      compute_ctrl_crc32(&snapshot[MODBUS_CTRL_REG_FIRST], MODBUS_CTRL_REG_COUNT);
-
-  if (expected_crc != actual_crc) {
-    return MODBUS_APPLY_ERR_CRC;
+  if (candidate_schedule == NULL) {
+    return MODBUS_APPLY_ERR_INTERNAL;
   }
 
-  remote_ctrl_cfg_t candidate = {0};
-  regs_to_remote_cfg(snapshot, &candidate);
-
-  if (!validate_remote_cfg(&candidate)) {
+  if (!validate_light_schedule(candidate_schedule)) {
     return MODBUS_APPLY_ERR_RANGE;
   }
 
+  uint32_t next_version = 0;
   taskENTER_CRITICAL(&s_state_lock);
-  s_remote_active_cfg = candidate;
+  next_version = s_active_ctrl_version + 1U;
   taskEXIT_CRITICAL(&s_state_lock);
 
-  persist_remote_cfg(&candidate);
+  if (!persist_light_state(candidate_schedule, next_version)) {
+    return MODBUS_APPLY_ERR_INTERNAL;
+  }
 
+  taskENTER_CRITICAL(&s_state_lock);
+  memcpy(s_active_schedule, candidate_schedule, sizeof(s_active_schedule));
+  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+    s_remote_active_cfg.periods[i] = candidate_schedule[i];
+  }
+  s_active_ctrl_version = next_version;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  uint16_t ver_hi = 0;
+  uint16_t ver_lo = 0;
+  u32_to_regs(next_version, &ver_hi, &ver_lo);
   ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_HI] = snapshot[MODBUS_HREG_CTRL_VERSION_HI];
-  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_LO] = snapshot[MODBUS_HREG_CTRL_VERSION_LO];
+  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_HI] = ver_hi;
+  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_LO] = ver_lo;
   ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+
+  ESP_LOGI(TAG, "Light schedule applied: active_ctrl_version=%lu",
+           (unsigned long)next_version);
+  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+    ESP_LOGI(TAG, "Light schedule slot %d: EN=%u ON=%04u OFF=%04u", i,
+             (unsigned)candidate_schedule[i].enable,
+             (unsigned)candidate_schedule[i].on_hhmm,
+             (unsigned)candidate_schedule[i].off_hhmm);
+  }
 
   return MODBUS_APPLY_OK;
 }
@@ -881,26 +1267,21 @@ static void modbus_runtime_task(void *arg) {
     // Fallback polling path: detect RTC token writes even if FC wrappers were not hit.
     queue_rtc_sync_request_from_regs();
     process_pending_rtc_sync();
+    queue_apply_request_from_regs();
 
-    uint16_t apply_cmd = 0;
-    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-    apply_cmd = s_holding_regs[MODBUS_HREG_APPLY_CMD];
-    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+    light_period_cfg_t pending_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+    bool has_pending_apply = false;
+    taskENTER_CRITICAL(&s_state_lock);
+    has_pending_apply = s_apply_pending;
+    if (has_pending_apply) {
+      memcpy(pending_schedule, s_apply_pending_schedule, sizeof(pending_schedule));
+      s_apply_pending = false;
+    }
+    taskEXIT_CRITICAL(&s_state_lock);
 
-    if (apply_cmd != MODBUS_APPLY_CMD_NONE) {
-      modbus_apply_status_t status = MODBUS_APPLY_ERR_CMD;
-      if (apply_cmd == MODBUS_APPLY_CMD_APPLY) {
-        status = apply_control_block();
-      }
-
-      taskENTER_CRITICAL(&s_state_lock);
-      s_last_apply_status = status;
-      taskEXIT_CRITICAL(&s_state_lock);
-
-      ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-      s_holding_regs[MODBUS_HREG_APPLY_CMD] = MODBUS_APPLY_CMD_NONE;
-      update_diag_regs_locked();
-      ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+    if (has_pending_apply) {
+      modbus_apply_status_t status = apply_control_block(pending_schedule);
+      finalize_apply_result(status);
     }
 
     uint32_t now = now_ms();
@@ -927,6 +1308,7 @@ static void modbus_runtime_task(void *arg) {
                "Mode changed: REMOTE -> AUTONOMOUS (master timeout > %u ms), "
                "forced windows targets A/B to 0%%",
                (unsigned)MODBUS_HEARTBEAT_TIMEOUT_MS);
+      modbus_get_light_relay_state(NULL, NULL);
     }
 
     ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
@@ -957,10 +1339,12 @@ void modbus_init(void) {
 
   memset(s_holding_regs, 0, sizeof(s_holding_regs));
   remote_cfg_to_regs(&s_remote_active_cfg, s_holding_regs);
-  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_HI] =
-      s_holding_regs[MODBUS_HREG_CTRL_VERSION_HI];
-  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_LO] =
-      s_holding_regs[MODBUS_HREG_CTRL_VERSION_LO];
+  light_schedule_to_regs(s_staging_schedule, s_holding_regs);
+  uint16_t ver_hi = 0;
+  uint16_t ver_lo = 0;
+  u32_to_regs(s_active_ctrl_version, &ver_hi, &ver_lo);
+  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_HI] = ver_hi;
+  s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_LO] = ver_lo;
   s_holding_regs[MODBUS_HREG_SOLAR_RADIATION_X10] = 0;
   s_holding_regs[MODBUS_HREG_SOLAR_UPPER_THRESHOLD_X10] =
       MODBUS_SOLAR_DEFAULT_THRESHOLD_X10;
@@ -972,7 +1356,18 @@ void modbus_init(void) {
   s_holding_regs[MODBUS_HREG_RTC_SET_RESULT] = MODBUS_RTC_SET_RESULT_NONE;
 
   s_last_apply_status = MODBUS_APPLY_OK;
+  s_apply_pending = false;
+  memset(s_apply_pending_schedule, 0, sizeof(s_apply_pending_schedule));
+  s_apply_ok_count = 0;
+  s_apply_fail_invalid_count = 0;
+  s_apply_fail_busy_count = 0;
+  s_apply_fail_internal_count = 0;
+  s_last_apply_error_code = MODBUS_APPLY_OK;
+  s_last_apply_ts_ms = 0;
+  s_last_logged_schedule_mask = UINT8_MAX;
+  s_last_logged_schedule_mode = UINT8_MAX;
   s_last_master_seen_ms = now_ms();
+  s_light_set_ms = s_last_master_seen_ms;
   s_good_cycle_streak = 0;
   s_mode_state = MODBUS_MODE_REMOTE;
   s_mode_reason = MODBUS_REASON_NONE;
@@ -1045,9 +1440,13 @@ void modbus_set_light_current_time(uint8_t hour, uint8_t minute, uint8_t second)
   if (hour > 23U || minute > 59U || second > 59U) {
     return;
   }
+  uint32_t set_ms = now_ms();
+  taskENTER_CRITICAL(&s_state_lock);
   s_light_hour = hour;
   s_light_minute = minute;
   s_light_second = second;
+  s_light_set_ms = set_ms;
+  taskEXIT_CRITICAL(&s_state_lock);
 }
 
 uint8_t modbus_get_light_percent(void) {
@@ -1067,11 +1466,37 @@ void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on) {
   bool out1 = false;
   bool out2 = false;
   bool reduction = false;
+  light_period_cfg_t effective_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+  modbus_mode_state_t mode = MODBUS_MODE_REMOTE;
+  uint8_t light_hour = 0;
+  uint8_t light_minute = 0;
+  uint8_t light_second = 0;
+  uint32_t light_set_ms = 0;
 
-  if (s_light_hour <= 23U && s_light_minute <= 59U && s_light_second <= 59U) {
-    remote_ctrl_cfg_t cfg = get_effective_cfg();
-    uint16_t minute_of_day = (uint16_t)(s_light_hour * 60U + s_light_minute);
-    bool schedule_active = is_now_in_periods(&cfg, minute_of_day);
+  taskENTER_CRITICAL(&s_state_lock);
+  mode = s_mode_state;
+  if (mode == MODBUS_MODE_AUTONOMOUS) {
+    memcpy(effective_schedule, s_autonomous_cfg.periods, sizeof(effective_schedule));
+  } else {
+    memcpy(effective_schedule, s_active_schedule, sizeof(effective_schedule));
+  }
+  light_hour = s_light_hour;
+  light_minute = s_light_minute;
+  light_second = s_light_second;
+  light_set_ms = s_light_set_ms;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (light_hour <= 23U && light_minute <= 59U && light_second <= 59U) {
+    uint32_t base_sec =
+        (uint32_t)light_hour * 3600U + (uint32_t)light_minute * 60U + (uint32_t)light_second;
+    uint32_t elapsed_sec = (now_ms() - light_set_ms) / 1000U;
+    uint32_t sec_of_day = (base_sec + elapsed_sec) % 86400U;
+    uint16_t minute_of_day = (uint16_t)(sec_of_day / 60U);
+    uint8_t active_mask = get_active_schedule_mask(effective_schedule, minute_of_day);
+    bool schedule_active = (active_mask != 0U);
+
+    log_active_light_schedules_if_changed(effective_schedule, mode, minute_of_day,
+                                          active_mask);
 
     if (schedule_active) {
       uint16_t radiation_x10 = 0;
@@ -1122,8 +1547,21 @@ void modbus_set_solar_radiation(float radiation) {
 }
 
 float modbus_get_window_a_target_percent(void) {
-  remote_ctrl_cfg_t cfg = get_effective_cfg();
-  return ((float)cfg.windows_pos_a_target) / 10.0f;
+  if (modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS) {
+    return ((float)s_autonomous_cfg.windows_pos_a_target) / 10.0f;
+  }
+
+  uint16_t raw_target = 0;
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    raw_target = s_holding_regs[MODBUS_HREG_WINDOWS_POS_A_TARGET];
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  }
+
+  if (raw_target > 1000U) {
+    raw_target = 1000U;
+  }
+  return ((float)raw_target) / 10.0f;
 }
 
 modbus_mode_state_t modbus_get_mode_state(void) {

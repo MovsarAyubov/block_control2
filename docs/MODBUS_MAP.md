@@ -1,4 +1,4 @@
-﻿# Modbus карта регистров (кратко)
+# Modbus карта регистров (кратко)
 
 Формат значений по умолчанию: `x10` (fixed point), если не указано иное.
 
@@ -36,12 +36,12 @@
 - 119 SCH3_ENABLE
 - 120 SCH3_ON_HHMM
 - 121 SCH3_OFF_HHMM
-- 122 APPLY_CMD
-- 123 CTRL_CRC_LO
-- 124 CTRL_CRC_HI
-- 125 APPLY_STATUS
-- 126 ACTIVE_CTRL_VERSION_HI
-- 127 ACTIVE_CTRL_VERSION_LO
+- 122 APPLY_CMD (W, триггер apply; каждая успешная запись в этот регистр = попытка apply)
+- 123 CTRL_CRC_LO (legacy/reserved)
+- 124 CTRL_CRC_HI (legacy/reserved)
+- 125 APPLY_STATUS (RO, статус последнего apply)
+- 126 ACTIVE_CTRL_VERSION_HI (RO)
+- 127 ACTIVE_CTRL_VERSION_LO (RO)
 
 ## Diagnostics/runtime
 - 128 MODE_STATE (0=REMOTE, 1=AUTONOMOUS)
@@ -58,12 +58,41 @@
 - 142 RTC_SET_TOKEN (W, ненулевой новый токен запускает обработку)
 - 143 RTC_SET_APPLIED_TOKEN (RO, токен последнего обработанного запроса)
 - 144 RTC_SET_RESULT (RO)
+- 145 APPLY_OK_COUNT_HI
+- 146 APPLY_OK_COUNT_LO
+- 147 APPLY_FAIL_INVALID_COUNT_HI
+- 148 APPLY_FAIL_INVALID_COUNT_LO
+- 149 APPLY_FAIL_BUSY_COUNT_HI
+- 150 APPLY_FAIL_BUSY_COUNT_LO
+- 151 APPLY_FAIL_INTERNAL_COUNT_HI
+- 152 APPLY_FAIL_INTERNAL_COUNT_LO
+- 153 LAST_APPLY_ERROR_CODE
+- 154 LAST_APPLY_TS_MS_HI
+- 155 LAST_APPLY_TS_MS_LO
 
 ## Свет
 Логика реле вычисляется внутри slave:
 - Вне расписания: 0%
 - В расписании и радиация < порога: 100%
 - В расписании и радиация >= порога: 50%
+
+Дополнительно:
+- `110..121` - staging schedule (теневая конфигурация).
+- active schedule меняется только в apply-процедуре после записи в `122`.
+- Для `ENABLE=1` интервал `ON == OFF` считается невалидным (reject).
+- Интервалы через полночь (`ON > OFF`) валидны.
+- Если новый apply приходит во время обработки предыдущего: очередь глубиной 1 (`latest wins`).
+
+## APPLY status (`125`)
+- 0 APPLIED/OK
+- 2 INVALID_RANGE
+- 3 BUSY
+- 5 INTERNAL_ERROR
+
+## Persist/Reboot стратегия
+- Active schedule + `ACTIVE_CTRL_VERSION` сохраняются в NVS (`light_state`) с CRC32.
+- При невалидном/отсутствующем blob используется safe-default: все `SCHx_ENABLE=0`.
+- После старта `110..121` отражают staging schedule (из сохраненного active либо safe-default).
 
 ## RTC sync (`RTC_SET_RESULT`, регистр 144)
 - 2 APPLIED (RTC обновлен)
