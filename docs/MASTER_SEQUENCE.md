@@ -17,11 +17,11 @@
 
 ### Шаг 1: Проверка связи
 - Прочитать диагностику:
-  - `128` MODE_STATE
-  - `129` MODE_REASON
-  - `130..131` LAST_MASTER_SEEN_MS
-  - `132` GOOD_CYCLE_STREAK
-  - `133` LAST_APPLY_STATUS
+  - `9` MODE_STATE
+  - `10` MODE_REASON
+  - `11..12` LAST_MASTER_SEEN_MS
+  - `13` GOOD_CYCLE_STREAK
+  - `14` LAST_APPLY_STATUS
 
 ### Шаг 2: Установить порог радиации
 - Записать `135` SOLAR_UPPER_THRESHOLD_X10 (например, `8000` = 800.0).
@@ -49,7 +49,7 @@
     WATER_UPPER_HEAT, WINDOWS_POS_A, WINDOWS_POS_B, CURTAIN_POS
 
 ### Шаг 3: Чтение статусов режима
-- Прочитать `128..133`.
+- Прочитать `9..14`.
 - Дополнительно прочитать `136` LIGHT_REDUCTION_ACTIVE.
 
 ## 5. RTC-синхронизация (по токену)
@@ -86,7 +86,7 @@
   - `2` INVALID_RANGE
   - `3` BUSY
   - `5` INTERNAL_ERROR
-- `128 MODE_STATE`:
+- `9 MODE_STATE`:
   - `0` REMOTE
   - `1` AUTONOMOUS
 - `136 LIGHT_REDUCTION_ACTIVE`:
@@ -104,6 +104,6 @@ Slave сам управляет двумя реле света:
 Каждый цикл:
 1. Write `134` (радиация)
 2. Read `0..8` (телеметрия)
-3. Read `128..136` (диагностика + свет)
+3. Read `9..14` и `134..136` (диагностика + свет)
 
 Этого достаточно для heartbeat, мониторинга и управления светом через радиацию/расписание.

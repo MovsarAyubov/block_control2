@@ -826,13 +826,16 @@ static void process_pending_rtc_sync(void) {
     return;
   }
 
-  bool callbacks_ready = false;
+  modbus_rtc_set_time_cb_t rtc_set_cb = NULL;
+  void *rtc_ctx = NULL;
   taskENTER_CRITICAL(&s_state_lock);
-  callbacks_ready =
-      (s_rtc_get_time_cb != NULL) && (s_rtc_set_time_cb != NULL);
+  rtc_set_cb = s_rtc_set_time_cb;
+  rtc_ctx = s_rtc_cb_ctx;
   taskEXIT_CRITICAL(&s_state_lock);
-  if (!callbacks_ready) {
-    // RTC layer is not bound yet; keep pending request and retry next cycle.
+  if (rtc_set_cb == NULL) {
+    ESP_LOGW(TAG, "RTC sync token=%u failed: set callback is not bound",
+             (unsigned)token);
+    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_FAILED);
     return;
   }
 
@@ -844,36 +847,32 @@ static void process_pending_rtc_sync(void) {
   uint8_t local_hour = 0;
   uint8_t local_minute = 0;
   uint8_t local_second = 0;
-  if (!get_local_time_snapshot(&local_hour, &local_minute, &local_second)) {
-    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_FAILED);
-    return;
+  bool have_local_time =
+      get_local_time_snapshot(&local_hour, &local_minute, &local_second);
+  if (!have_local_time) {
+    ESP_LOGW(TAG,
+             "RTC sync token=%u: local time unavailable, forcing time update",
+             (unsigned)token);
+  }
+  if (have_local_time) {
+    uint16_t server_total_min =
+        (uint16_t)(server_hour * 60U + server_minute);
+    uint16_t local_total_min =
+        (uint16_t)(local_hour * 60U + local_minute);
+    uint16_t direct_diff = (server_total_min >= local_total_min)
+                               ? (uint16_t)(server_total_min - local_total_min)
+                               : (uint16_t)(local_total_min - server_total_min);
+    uint16_t drift_min = (direct_diff <= (uint16_t)(1440U - direct_diff))
+                             ? direct_diff
+                             : (uint16_t)(1440U - direct_diff);
+
+    if (drift_min < MODBUS_RTC_SYNC_THRESHOLD_MIN) {
+      finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_NOOP);
+      return;
+    }
   }
 
-  uint16_t server_total_min =
-      (uint16_t)(server_hour * 60U + server_minute);
-  uint16_t local_total_min =
-      (uint16_t)(local_hour * 60U + local_minute);
-  uint16_t direct_diff = (server_total_min >= local_total_min)
-                             ? (uint16_t)(server_total_min - local_total_min)
-                             : (uint16_t)(local_total_min - server_total_min);
-  uint16_t drift_min = (direct_diff <= (uint16_t)(1440U - direct_diff))
-                           ? direct_diff
-                           : (uint16_t)(1440U - direct_diff);
-
-  if (drift_min < MODBUS_RTC_SYNC_THRESHOLD_MIN) {
-    finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_NOOP);
-    return;
-  }
-
-  modbus_rtc_set_time_cb_t rtc_set_cb = NULL;
-  void *rtc_ctx = NULL;
-  taskENTER_CRITICAL(&s_state_lock);
-  rtc_set_cb = s_rtc_set_time_cb;
-  rtc_ctx = s_rtc_cb_ctx;
-  taskEXIT_CRITICAL(&s_state_lock);
-
-  if (rtc_set_cb == NULL ||
-      !rtc_set_cb((uint8_t)server_hour, (uint8_t)server_minute, 0U, rtc_ctx)) {
+  if (!rtc_set_cb((uint8_t)server_hour, (uint8_t)server_minute, 0U, rtc_ctx)) {
     finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_FAILED);
     return;
   }
