@@ -54,7 +54,7 @@ static const char *TAG = "APP";
 
 // Light relays
 #define LIGHT_RELAY_1_GPIO 4
-#define LIGHT_RELAY_2_GPIO 16
+#define LIGHT_RELAY_2_GPIO 2
 
 #define CONTROL_LOOP_MS 200
 #define SENSOR_LOOP_MS 5000

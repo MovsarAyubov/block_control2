@@ -29,8 +29,23 @@ static const char *TAG = "MB_SLAVE";
 
 #define MODBUS_HEARTBEAT_TIMEOUT_MS 30000U
 #define MODBUS_CYCLE_TASK_PERIOD_MS 100U
-#define MODBUS_SOLAR_DEFAULT_THRESHOLD_X10 8000U
 #define MODBUS_RTC_SYNC_THRESHOLD_MIN 3U
+#define MODBUS_WEATHER_STALE_TIMEOUT_MS 30000U
+#define MODBUS_WEATHER_MAX_SOURCE_AGE_S 30U
+#define MODBUS_LIGHT_STATUS_R1_SCHEDULE_ACTIVE (1U << 0)
+#define MODBUS_LIGHT_STATUS_R2_SCHEDULE_ACTIVE (1U << 1)
+#define MODBUS_LIGHT_STATUS_R1_ON_DELAY_ACTIVE (1U << 2)
+#define MODBUS_LIGHT_STATUS_R2_ON_DELAY_ACTIVE (1U << 3)
+#define MODBUS_LIGHT_STATUS_R1_DLI_LIMIT (1U << 4)
+#define MODBUS_LIGHT_STATUS_R2_DLI_LIMIT (1U << 5)
+#define MODBUS_LIGHT_STATUS_R1_HYST_HOLD (1U << 6)
+#define MODBUS_LIGHT_STATUS_R2_HYST_HOLD (1U << 7)
+#define MODBUS_LIGHT_STATUS_WEATHER_STALE (1U << 8)
+#define MODBUS_LIGHT_STATUS_R1_OUTPUT_ON (1U << 9)
+#define MODBUS_LIGHT_STATUS_R2_OUTPUT_ON (1U << 10)
+#define MODBUS_LIGHT_RELAY_COUNT 2
+#define MODBUS_LIGHT_ZONE_DELAY_STEP_SEC 10U
+#define MODBUS_LIGHT_AUTO_APPLY_SETTLE_MS 250U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -44,14 +59,22 @@ static const char *TAG = "MB_SLAVE";
 
 #define MODBUS_FC_COUNT 10
 
-// APPLY command values
-#define MODBUS_APPLY_CMD_NONE 0
-
 typedef struct {
   uint16_t enable;
   uint16_t on_hhmm;
   uint16_t off_hhmm;
 } light_period_cfg_t;
+
+typedef struct {
+  light_period_cfg_t schedule;
+  uint16_t threshold_wm2;
+  uint16_t dli_off_limit_jcm2;
+} light_relay_cfg_t;
+
+typedef struct {
+  light_relay_cfg_t relay[MODBUS_LIGHT_RELAY_COUNT];
+  uint16_t hyst_sec;
+} light_control_cfg_t;
 
 typedef struct {
   uint32_t ctrl_version;
@@ -75,7 +98,7 @@ typedef struct {
   uint32_t active_ctrl_version;
   uint16_t last_applied_token;
   uint16_t reserved;
-  light_period_cfg_t active_schedule[MODBUS_LIGHT_MAX_PERIODS];
+  light_control_cfg_t active_cfg;
   uint32_t crc32;
 } persisted_light_state_t;
 
@@ -84,6 +107,19 @@ typedef struct {
   mb_fn_handler_fp original;
   mb_fn_handler_fp wrapper;
 } modbus_handler_wrap_t;
+
+typedef struct {
+  int16_t out_temp;
+  uint16_t out_hum;
+  uint16_t wind_speed;
+  uint16_t wind_dir;
+  uint16_t rain_flag;
+  uint16_t solar_rad;
+  uint16_t baro_press;
+  int16_t dew_point;
+  uint16_t status_bits;
+  uint16_t source_age_s;
+} weather_snapshot_t;
 
 static void *s_mbc_slave_handler = NULL;
 static mb_register_area_descriptor_t s_holding_area;
@@ -100,11 +136,11 @@ static volatile uint32_t s_last_master_seen_ms = 0;
 static volatile uint16_t s_good_cycle_streak = 0;
 static volatile modbus_apply_status_t s_last_apply_status = MODBUS_APPLY_OK;
 
-static light_period_cfg_t s_staging_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
-static light_period_cfg_t s_active_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+static light_control_cfg_t s_staging_light_cfg = {0};
+static light_control_cfg_t s_active_light_cfg = {0};
 static uint32_t s_active_ctrl_version = 0;
 static volatile bool s_apply_pending = false;
-static light_period_cfg_t s_apply_pending_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+static light_control_cfg_t s_apply_pending_light_cfg = {0};
 static volatile uint32_t s_apply_ok_count = 0;
 static volatile uint32_t s_apply_fail_invalid_count = 0;
 static volatile uint32_t s_apply_fail_busy_count = 0;
@@ -113,12 +149,30 @@ static volatile modbus_apply_status_t s_last_apply_error_code = MODBUS_APPLY_OK;
 static volatile uint32_t s_last_apply_ts_ms = 0;
 static volatile uint8_t s_last_logged_schedule_mask = UINT8_MAX;
 static volatile uint8_t s_last_logged_schedule_mode = UINT8_MAX;
+static volatile uint8_t s_light_stable_on_mask = 0;
+static volatile uint8_t s_light_pending_valid_mask = 0;
+static volatile uint8_t s_light_pending_target_on_mask = 0;
+static volatile uint32_t s_light_pending_since_ms[MODBUS_LIGHT_RELAY_COUNT] = {0};
+static volatile uint32_t s_light_on_delay_since_ms[MODBUS_LIGHT_RELAY_COUNT] = {0};
+static volatile bool s_light_cfg_dirty = false;
+static volatile uint32_t s_light_cfg_last_change_ms = 0;
+static volatile uint16_t s_last_logged_light_output_percent = UINT16_MAX;
+static volatile uint16_t s_last_logged_light_status_bits = UINT16_MAX;
 
 static volatile uint16_t s_rtc_last_token = 0;
 static volatile uint16_t s_rtc_pending_token = 0;
 static volatile uint16_t s_rtc_pending_hour = 0;
 static volatile uint16_t s_rtc_pending_minute = 0;
 static volatile bool s_rtc_sync_pending = false;
+
+static volatile uint16_t s_weather_last_token = 0;
+static volatile uint16_t s_weather_pending_token = 0;
+static volatile bool s_weather_sync_pending = false;
+static weather_snapshot_t s_weather_pending_snapshot = {0};
+static weather_snapshot_t s_weather_active_snapshot = {0};
+static volatile uint32_t s_weather_last_rx_ms = 0;
+static volatile bool s_weather_valid = false;
+static volatile bool s_weather_stale = true;
 
 static volatile uint32_t s_rtc_sync_applied_count = 0;
 static volatile uint32_t s_rtc_sync_noop_count = 0;
@@ -143,7 +197,7 @@ static const remote_ctrl_cfg_t s_autonomous_cfg = {
     .sp_water_grow = 320,
     .sp_water_upper = 360,
     .sp_water_undertray = 300,
-    .periods = {{1, 600, 2200}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}},
+    .periods = {{1, 600, 2200}},
 };
 
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -174,6 +228,14 @@ static bool get_local_time_snapshot(uint8_t *hour, uint8_t *minute,
                                     uint8_t *second);
 static void finalize_rtc_sync(uint16_t token, modbus_rtc_set_result_t result);
 static void process_pending_rtc_sync(void);
+static bool load_weather_snapshot_from_regs(weather_snapshot_t *snapshot,
+                                            uint16_t *token);
+static bool weather_payload_equal(const weather_snapshot_t *lhs,
+                                  const weather_snapshot_t *rhs);
+static void queue_weather_sync_request_from_regs(void);
+static void finalize_weather_sync(uint16_t token,
+                                  modbus_weather_set_result_t result);
+static void process_pending_weather_sync(void);
 static void queue_apply_request_from_regs(void);
 static void sync_staging_schedule_from_current_regs(void);
 static void queue_apply_request_from_current_regs(void);
@@ -183,13 +245,13 @@ static bool reg_span_contains(uint16_t start_reg, uint16_t reg_count,
                               uint16_t target_reg);
 static bool reg_span_intersects(uint16_t start_reg, uint16_t reg_count,
                                 uint16_t first_reg, uint16_t last_reg);
-static uint8_t get_active_schedule_mask(const light_period_cfg_t *periods,
-                                        uint16_t minute_of_day);
+static uint8_t get_active_light_schedule_mask(const light_control_cfg_t *cfg,
+                                              uint16_t minute_of_day);
 static void log_active_light_schedules_if_changed(
-    const light_period_cfg_t *periods, modbus_mode_state_t mode,
+    const light_control_cfg_t *cfg, modbus_mode_state_t mode,
     uint16_t minute_of_day, uint8_t active_mask);
 static modbus_apply_status_t apply_control_block(
-    const light_period_cfg_t *candidate_schedule);
+    const light_control_cfg_t *candidate_cfg);
 
 static modbus_handler_wrap_t s_handler_wraps[MODBUS_FC_COUNT] = {
     {.fc = 0x01, .original = NULL, .wrapper = modbus_fc_01_wrapper},
@@ -267,90 +329,235 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
   return ~crc;
 }
 
-static void light_schedule_to_regs(const light_period_cfg_t *periods, uint16_t *regs) {
-  if (!periods || !regs) {
+static void light_ctrl_to_regs(const light_control_cfg_t *cfg, uint16_t *regs) {
+  if (!cfg || !regs) {
     return;
   }
 
-  regs[MODBUS_HREG_SCH0_ENABLE] = periods[0].enable;
-  regs[MODBUS_HREG_SCH0_ON_HHMM] = periods[0].on_hhmm;
-  regs[MODBUS_HREG_SCH0_OFF_HHMM] = periods[0].off_hhmm;
-  regs[MODBUS_HREG_SCH1_ENABLE] = periods[1].enable;
-  regs[MODBUS_HREG_SCH1_ON_HHMM] = periods[1].on_hhmm;
-  regs[MODBUS_HREG_SCH1_OFF_HHMM] = periods[1].off_hhmm;
-  regs[MODBUS_HREG_SCH2_ENABLE] = periods[2].enable;
-  regs[MODBUS_HREG_SCH2_ON_HHMM] = periods[2].on_hhmm;
-  regs[MODBUS_HREG_SCH2_OFF_HHMM] = periods[2].off_hhmm;
-  regs[MODBUS_HREG_SCH3_ENABLE] = periods[3].enable;
-  regs[MODBUS_HREG_SCH3_ON_HHMM] = periods[3].on_hhmm;
-  regs[MODBUS_HREG_SCH3_OFF_HHMM] = periods[3].off_hhmm;
+  regs[MODBUS_HREG_LIGHT_R1_ENABLE] = cfg->relay[0].schedule.enable;
+  regs[MODBUS_HREG_LIGHT_R1_ON_HHMM] = cfg->relay[0].schedule.on_hhmm;
+  regs[MODBUS_HREG_LIGHT_R1_OFF_HHMM] = cfg->relay[0].schedule.off_hhmm;
+  regs[MODBUS_HREG_LIGHT_R1_THRESHOLD_WM2] = cfg->relay[0].threshold_wm2;
+  regs[MODBUS_HREG_LIGHT_R1_RESERVED] = 0U;
+  regs[MODBUS_HREG_LIGHT_R1_DLI_OFF_LIMIT_JCM2] =
+      cfg->relay[0].dli_off_limit_jcm2;
+  regs[MODBUS_HREG_LIGHT_R2_ENABLE] = cfg->relay[1].schedule.enable;
+  regs[MODBUS_HREG_LIGHT_R2_ON_HHMM] = cfg->relay[1].schedule.on_hhmm;
+  regs[MODBUS_HREG_LIGHT_R2_OFF_HHMM] = cfg->relay[1].schedule.off_hhmm;
+  regs[MODBUS_HREG_LIGHT_R2_THRESHOLD_WM2] = cfg->relay[1].threshold_wm2;
+  regs[MODBUS_HREG_LIGHT_R2_RESERVED] = 0U;
+  regs[MODBUS_HREG_LIGHT_R2_DLI_OFF_LIMIT_JCM2] =
+      cfg->relay[1].dli_off_limit_jcm2;
+  regs[MODBUS_HREG_LIGHT_HYST_SEC] = cfg->hyst_sec;
 }
 
-static void regs_to_light_schedule(const uint16_t *regs, light_period_cfg_t *periods) {
-  if (!periods || !regs) {
+static void regs_to_light_ctrl(const uint16_t *regs, light_control_cfg_t *cfg) {
+  if (!cfg || !regs) {
     return;
   }
 
-  periods[0].enable = regs[MODBUS_HREG_SCH0_ENABLE];
-  periods[0].on_hhmm = regs[MODBUS_HREG_SCH0_ON_HHMM];
-  periods[0].off_hhmm = regs[MODBUS_HREG_SCH0_OFF_HHMM];
-  periods[1].enable = regs[MODBUS_HREG_SCH1_ENABLE];
-  periods[1].on_hhmm = regs[MODBUS_HREG_SCH1_ON_HHMM];
-  periods[1].off_hhmm = regs[MODBUS_HREG_SCH1_OFF_HHMM];
-  periods[2].enable = regs[MODBUS_HREG_SCH2_ENABLE];
-  periods[2].on_hhmm = regs[MODBUS_HREG_SCH2_ON_HHMM];
-  periods[2].off_hhmm = regs[MODBUS_HREG_SCH2_OFF_HHMM];
-  periods[3].enable = regs[MODBUS_HREG_SCH3_ENABLE];
-  periods[3].on_hhmm = regs[MODBUS_HREG_SCH3_ON_HHMM];
-  periods[3].off_hhmm = regs[MODBUS_HREG_SCH3_OFF_HHMM];
+  cfg->relay[0].schedule.enable = regs[MODBUS_HREG_LIGHT_R1_ENABLE];
+  cfg->relay[0].schedule.on_hhmm = regs[MODBUS_HREG_LIGHT_R1_ON_HHMM];
+  cfg->relay[0].schedule.off_hhmm = regs[MODBUS_HREG_LIGHT_R1_OFF_HHMM];
+  cfg->relay[0].threshold_wm2 = regs[MODBUS_HREG_LIGHT_R1_THRESHOLD_WM2];
+  cfg->relay[0].dli_off_limit_jcm2 =
+      regs[MODBUS_HREG_LIGHT_R1_DLI_OFF_LIMIT_JCM2];
+  cfg->relay[1].schedule.enable = regs[MODBUS_HREG_LIGHT_R2_ENABLE];
+  cfg->relay[1].schedule.on_hhmm = regs[MODBUS_HREG_LIGHT_R2_ON_HHMM];
+  cfg->relay[1].schedule.off_hhmm = regs[MODBUS_HREG_LIGHT_R2_OFF_HHMM];
+  cfg->relay[1].threshold_wm2 = regs[MODBUS_HREG_LIGHT_R2_THRESHOLD_WM2];
+  cfg->relay[1].dli_off_limit_jcm2 =
+      regs[MODBUS_HREG_LIGHT_R2_DLI_OFF_LIMIT_JCM2];
+  cfg->hyst_sec = regs[MODBUS_HREG_LIGHT_HYST_SEC];
 }
 
-static bool validate_light_schedule(const light_period_cfg_t *periods) {
-  if (!periods) {
+static bool validate_light_ctrl(const light_control_cfg_t *cfg) {
+  if (!cfg) {
     return false;
   }
 
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    if (periods[i].enable > 1U) {
+  for (int i = 0; i < MODBUS_LIGHT_RELAY_COUNT; ++i) {
+    const light_relay_cfg_t *relay_cfg = &cfg->relay[i];
+    if (relay_cfg->schedule.enable > 1U) {
       return false;
     }
-    if (!hhmm_valid(periods[i].on_hhmm) || !hhmm_valid(periods[i].off_hhmm)) {
+    if (!hhmm_valid(relay_cfg->schedule.on_hhmm) ||
+        !hhmm_valid(relay_cfg->schedule.off_hhmm)) {
       return false;
     }
-    if (periods[i].enable == 1U && periods[i].on_hhmm == periods[i].off_hhmm) {
+    if (relay_cfg->schedule.enable == 1U &&
+        relay_cfg->schedule.on_hhmm == relay_cfg->schedule.off_hhmm) {
       return false;
     }
   }
+  if (cfg->hyst_sec > 86400U) {
+    return false;
+  }
+
   return true;
+}
+
+static bool light_schedule_equal(const light_period_cfg_t *lhs,
+                                 const light_period_cfg_t *rhs) {
+  if (lhs == NULL || rhs == NULL) {
+    return false;
+  }
+
+  return lhs->enable == rhs->enable && lhs->on_hhmm == rhs->on_hhmm &&
+         lhs->off_hhmm == rhs->off_hhmm;
+}
+
+static bool light_ctrl_equal(const light_control_cfg_t *lhs,
+                             const light_control_cfg_t *rhs) {
+  if (lhs == NULL || rhs == NULL) {
+    return false;
+  }
+
+  return light_schedule_equal(&lhs->relay[0].schedule, &rhs->relay[0].schedule) &&
+         light_schedule_equal(&lhs->relay[1].schedule, &rhs->relay[1].schedule) &&
+         lhs->relay[0].threshold_wm2 == rhs->relay[0].threshold_wm2 &&
+         lhs->relay[0].dli_off_limit_jcm2 ==
+             rhs->relay[0].dli_off_limit_jcm2 &&
+         lhs->relay[1].threshold_wm2 == rhs->relay[1].threshold_wm2 &&
+         lhs->relay[1].dli_off_limit_jcm2 ==
+             rhs->relay[1].dli_off_limit_jcm2 && lhs->hyst_sec == rhs->hyst_sec;
+}
+
+static void log_light_schedule_cfg(const char *prefix,
+                                   const light_period_cfg_t *schedule) {
+  if (prefix == NULL || schedule == NULL) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "%s EN=%u ON=%04u OFF=%04u", prefix,
+           (unsigned)schedule->enable, (unsigned)schedule->on_hhmm,
+           (unsigned)schedule->off_hhmm);
+}
+
+static void log_light_ctrl_cfg(const char *prefix, const light_control_cfg_t *cfg) {
+  if (prefix == NULL || cfg == NULL) {
+    return;
+  }
+
+  ESP_LOGI(TAG,
+           "%s R1[EN=%u ON=%04u OFF=%04u thr=%u dli=%u] "
+           "R2[EN=%u ON=%04u OFF=%04u thr=%u dli=%u] hyst_s=%u",
+           prefix, (unsigned)cfg->relay[0].schedule.enable,
+           (unsigned)cfg->relay[0].schedule.on_hhmm,
+           (unsigned)cfg->relay[0].schedule.off_hhmm,
+           (unsigned)cfg->relay[0].threshold_wm2,
+           (unsigned)cfg->relay[0].dli_off_limit_jcm2,
+           (unsigned)cfg->relay[1].schedule.enable,
+           (unsigned)cfg->relay[1].schedule.on_hhmm,
+           (unsigned)cfg->relay[1].schedule.off_hhmm,
+           (unsigned)cfg->relay[1].threshold_wm2,
+           (unsigned)cfg->relay[1].dli_off_limit_jcm2, (unsigned)cfg->hyst_sec);
+}
+
+static void log_light_runtime_state_if_changed(uint32_t sec_of_day,
+                                               uint16_t radiation_wm2,
+                                               uint16_t dli_current,
+                                               uint16_t output_percent,
+                                               uint16_t status_bits,
+                                               bool relay1_on,
+                                               bool relay2_on) {
+  bool should_log = false;
+
+  taskENTER_CRITICAL(&s_state_lock);
+  if (s_last_logged_light_output_percent != output_percent ||
+      s_last_logged_light_status_bits != status_bits) {
+    s_last_logged_light_output_percent = output_percent;
+    s_last_logged_light_status_bits = status_bits;
+    should_log = true;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (!should_log) {
+    return;
+  }
+
+  uint32_t hh = (sec_of_day / 3600U) % 24U;
+  uint32_t mm = (sec_of_day % 3600U) / 60U;
+  uint32_t ss = sec_of_day % 60U;
+
+  ESP_LOGI(
+      TAG,
+      "Light runtime: now=%02u:%02u:%02u out=%u%% relays=%u/%u rad=%u dli=%u "
+      "r1_schedule=%u r2_schedule=%u r1_delay=%u r2_delay=%u r1_dli=%u r2_dli=%u "
+      "r1_hyst=%u r2_hyst=%u weather_stale=%u "
+      "status=0x%04X",
+      (unsigned)hh, (unsigned)mm, (unsigned)ss, (unsigned)output_percent,
+      relay1_on ? 1U : 0U, relay2_on ? 1U : 0U, (unsigned)radiation_wm2,
+      (unsigned)dli_current,
+      (status_bits & MODBUS_LIGHT_STATUS_R1_SCHEDULE_ACTIVE) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R2_SCHEDULE_ACTIVE) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R1_ON_DELAY_ACTIVE) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R2_ON_DELAY_ACTIVE) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R1_DLI_LIMIT) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R2_DLI_LIMIT) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R1_HYST_HOLD) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_R2_HYST_HOLD) ? 1U : 0U,
+      (status_bits & MODBUS_LIGHT_STATUS_WEATHER_STALE) ? 1U : 0U,
+      (unsigned)status_bits);
 }
 
 static uint32_t compute_light_state_crc32(
     uint32_t active_ctrl_version, uint16_t last_applied_token,
-    const light_period_cfg_t *active_schedule) {
+    const light_control_cfg_t *active_cfg) {
   uint32_t crc = 0;
   crc = crc32_update(crc, (const uint8_t *)&active_ctrl_version,
                      sizeof(active_ctrl_version));
   crc = crc32_update(crc, (const uint8_t *)&last_applied_token,
                      sizeof(last_applied_token));
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    uint16_t fields[3] = {active_schedule[i].enable, active_schedule[i].on_hhmm,
-                          active_schedule[i].off_hhmm};
-    crc = crc32_update(crc, (const uint8_t *)fields, sizeof(fields));
-  }
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->relay[0].schedule.enable,
+                     sizeof(active_cfg->relay[0].schedule.enable));
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->relay[0].schedule.on_hhmm,
+                     sizeof(active_cfg->relay[0].schedule.on_hhmm));
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->relay[0].schedule.off_hhmm,
+                     sizeof(active_cfg->relay[0].schedule.off_hhmm));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&active_cfg->relay[0].threshold_wm2,
+                     sizeof(active_cfg->relay[0].threshold_wm2));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&active_cfg->relay[0].dli_off_limit_jcm2,
+                     sizeof(active_cfg->relay[0].dli_off_limit_jcm2));
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->relay[1].schedule.enable,
+                     sizeof(active_cfg->relay[1].schedule.enable));
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->relay[1].schedule.on_hhmm,
+                     sizeof(active_cfg->relay[1].schedule.on_hhmm));
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->relay[1].schedule.off_hhmm,
+                     sizeof(active_cfg->relay[1].schedule.off_hhmm));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&active_cfg->relay[1].threshold_wm2,
+                     sizeof(active_cfg->relay[1].threshold_wm2));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&active_cfg->relay[1].dli_off_limit_jcm2,
+                     sizeof(active_cfg->relay[1].dli_off_limit_jcm2));
+  crc = crc32_update(crc, (const uint8_t *)&active_cfg->hyst_sec,
+                     sizeof(active_cfg->hyst_sec));
   return crc;
 }
 
 static void set_default_light_state(void) {
-  memset(s_staging_schedule, 0, sizeof(s_staging_schedule));
-  memset(s_active_schedule, 0, sizeof(s_active_schedule));
-  memset(s_apply_pending_schedule, 0, sizeof(s_apply_pending_schedule));
+  memset(&s_staging_light_cfg, 0, sizeof(s_staging_light_cfg));
+  memset(&s_active_light_cfg, 0, sizeof(s_active_light_cfg));
+  memset(&s_apply_pending_light_cfg, 0, sizeof(s_apply_pending_light_cfg));
   s_apply_pending = false;
   s_active_ctrl_version = 0;
+  s_light_stable_on_mask = 0U;
+  s_light_pending_valid_mask = 0U;
+  s_light_pending_target_on_mask = 0U;
+  memset((void *)s_light_pending_since_ms, 0, sizeof(s_light_pending_since_ms));
+  memset((void *)s_light_on_delay_since_ms, 0, sizeof(s_light_on_delay_since_ms));
+  s_light_cfg_dirty = false;
+  s_light_cfg_last_change_ms = 0U;
+  s_last_logged_light_output_percent = UINT16_MAX;
+  s_last_logged_light_status_bits = UINT16_MAX;
 }
 
-static bool persist_light_state(const light_period_cfg_t *active_schedule,
+static bool persist_light_state(const light_control_cfg_t *active_cfg,
                                 uint32_t active_ctrl_version) {
-  if (active_schedule == NULL) {
+  if (active_cfg == NULL) {
     return false;
   }
 
@@ -366,10 +573,10 @@ static bool persist_light_state(const light_period_cfg_t *active_schedule,
   blob.magic = MODBUS_LIGHT_STATE_MAGIC;
   blob.active_ctrl_version = active_ctrl_version;
   blob.last_applied_token = 0U; // legacy field, not used by v2 apply semantics.
-  memcpy(blob.active_schedule, active_schedule, sizeof(blob.active_schedule));
+  blob.active_cfg = *active_cfg;
   blob.crc32 = compute_light_state_crc32(blob.active_ctrl_version,
                                          blob.last_applied_token,
-                                         blob.active_schedule);
+                                         &blob.active_cfg);
 
   err = nvs_set_blob(nvs, MODBUS_NVS_KEY_LIGHT_STATE, &blob, sizeof(blob));
   if (err == ESP_OK) {
@@ -400,19 +607,6 @@ static void remote_cfg_to_regs(const remote_ctrl_cfg_t *cfg, uint16_t *regs) {
   regs[MODBUS_HREG_SP_WATER_GROW] = cfg->sp_water_grow;
   regs[MODBUS_HREG_SP_WATER_UPPER] = cfg->sp_water_upper;
   regs[MODBUS_HREG_SP_WATER_UNDERTRAY] = cfg->sp_water_undertray;
-
-  regs[MODBUS_HREG_SCH0_ENABLE] = cfg->periods[0].enable;
-  regs[MODBUS_HREG_SCH0_ON_HHMM] = cfg->periods[0].on_hhmm;
-  regs[MODBUS_HREG_SCH0_OFF_HHMM] = cfg->periods[0].off_hhmm;
-  regs[MODBUS_HREG_SCH1_ENABLE] = cfg->periods[1].enable;
-  regs[MODBUS_HREG_SCH1_ON_HHMM] = cfg->periods[1].on_hhmm;
-  regs[MODBUS_HREG_SCH1_OFF_HHMM] = cfg->periods[1].off_hhmm;
-  regs[MODBUS_HREG_SCH2_ENABLE] = cfg->periods[2].enable;
-  regs[MODBUS_HREG_SCH2_ON_HHMM] = cfg->periods[2].on_hhmm;
-  regs[MODBUS_HREG_SCH2_OFF_HHMM] = cfg->periods[2].off_hhmm;
-  regs[MODBUS_HREG_SCH3_ENABLE] = cfg->periods[3].enable;
-  regs[MODBUS_HREG_SCH3_ON_HHMM] = cfg->periods[3].on_hhmm;
-  regs[MODBUS_HREG_SCH3_OFF_HHMM] = cfg->periods[3].off_hhmm;
 }
 
 static bool validate_remote_cfg(const remote_ctrl_cfg_t *cfg) {
@@ -504,14 +698,14 @@ static void load_persisted_settings(void) {
   err = nvs_get_blob(nvs, MODBUS_NVS_KEY_LIGHT_STATE, &light_blob, &light_blob_size);
   if (err == ESP_OK && light_blob_size == sizeof(light_blob) &&
       light_blob.magic == MODBUS_LIGHT_STATE_MAGIC &&
-      validate_light_schedule(light_blob.active_schedule)) {
+      validate_light_ctrl(&light_blob.active_cfg)) {
     uint32_t expected_crc =
         compute_light_state_crc32(light_blob.active_ctrl_version,
                                   light_blob.last_applied_token,
-                                  light_blob.active_schedule);
+                                  &light_blob.active_cfg);
     if (expected_crc == light_blob.crc32) {
-      memcpy(s_active_schedule, light_blob.active_schedule, sizeof(s_active_schedule));
-      memcpy(s_staging_schedule, light_blob.active_schedule, sizeof(s_staging_schedule));
+      s_active_light_cfg = light_blob.active_cfg;
+      s_staging_light_cfg = light_blob.active_cfg;
       s_active_ctrl_version = light_blob.active_ctrl_version;
     } else {
       set_default_light_state();
@@ -528,7 +722,7 @@ static void load_persisted_settings(void) {
     persist_remote_cfg(&s_remote_active_cfg);
   }
   if (need_persist_default_light) {
-    (void)persist_light_state(s_active_schedule, s_active_ctrl_version);
+    (void)persist_light_state(&s_active_light_cfg, s_active_ctrl_version);
   }
 }
 
@@ -555,15 +749,15 @@ static bool is_period_active(const light_period_cfg_t *slot, uint16_t now_minute
   return (now_minute_of_day >= start) || (now_minute_of_day < end);
 }
 
-static uint8_t get_active_schedule_mask(const light_period_cfg_t *periods,
-                                        uint16_t minute_of_day) {
-  if (!periods) {
+static uint8_t get_active_light_schedule_mask(const light_control_cfg_t *cfg,
+                                              uint16_t minute_of_day) {
+  if (!cfg) {
     return 0U;
   }
 
   uint8_t active_mask = 0U;
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    if (is_period_active(&periods[i], minute_of_day)) {
+  for (int i = 0; i < MODBUS_LIGHT_RELAY_COUNT; ++i) {
+    if (is_period_active(&cfg->relay[i].schedule, minute_of_day)) {
       active_mask |= (uint8_t)(1U << i);
     }
   }
@@ -571,9 +765,9 @@ static uint8_t get_active_schedule_mask(const light_period_cfg_t *periods,
 }
 
 static void log_active_light_schedules_if_changed(
-    const light_period_cfg_t *periods, modbus_mode_state_t mode,
+    const light_control_cfg_t *cfg, modbus_mode_state_t mode,
     uint16_t minute_of_day, uint8_t active_mask) {
-  if (periods == NULL || minute_of_day >= 1440U) {
+  if (cfg == NULL || minute_of_day >= 1440U) {
     return;
   }
 
@@ -593,17 +787,19 @@ static void log_active_light_schedules_if_changed(
 
   uint16_t hh = (uint16_t)(minute_of_day / 60U);
   uint16_t mm = (uint16_t)(minute_of_day % 60U);
-  ESP_LOGI(TAG, "Light schedules active: mode=%s now=%02u:%02u mask=0x%02X",
+  ESP_LOGI(TAG, "Light schedules active: mode=%s now=%02u:%02u r1=%u r2=%u",
            (mode == MODBUS_MODE_AUTONOMOUS) ? "AUTONOMOUS" : "REMOTE",
-           (unsigned)hh, (unsigned)mm, (unsigned)active_mask);
+           (unsigned)hh, (unsigned)mm, (unsigned)((active_mask & 0x01U) != 0U),
+           (unsigned)((active_mask & 0x02U) != 0U));
   if (active_mask == 0U) {
     return;
   }
 
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
+  for (int i = 0; i < MODBUS_LIGHT_RELAY_COUNT; ++i) {
     if ((active_mask & (uint8_t)(1U << i)) != 0U) {
-      ESP_LOGI(TAG, "Light schedule slot %d active: %04u..%04u", i,
-               (unsigned)periods[i].on_hhmm, (unsigned)periods[i].off_hhmm);
+      ESP_LOGI(TAG, "Relay %d schedule active: %04u..%04u", i + 1,
+               (unsigned)cfg->relay[i].schedule.on_hhmm,
+               (unsigned)cfg->relay[i].schedule.off_hhmm);
     }
   }
 }
@@ -881,6 +1077,150 @@ static void process_pending_rtc_sync(void) {
   finalize_rtc_sync(token, MODBUS_RTC_SET_RESULT_APPLIED);
 }
 
+static bool load_weather_snapshot_from_regs(weather_snapshot_t *snapshot,
+                                            uint16_t *token) {
+  if (snapshot == NULL || token == NULL || s_mbc_slave_handler == NULL) {
+    return false;
+  }
+
+  weather_snapshot_t tmp = {0};
+  uint16_t local_token = 0;
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  tmp.out_temp = (int16_t)s_holding_regs[MODBUS_HREG_WEATHER_OUT_TEMP];
+  tmp.out_hum = s_holding_regs[MODBUS_HREG_WEATHER_OUT_HUM];
+  tmp.wind_speed = s_holding_regs[MODBUS_HREG_WEATHER_WIND_SPEED];
+  tmp.wind_dir = s_holding_regs[MODBUS_HREG_WEATHER_WIND_DIR];
+  tmp.rain_flag = s_holding_regs[MODBUS_HREG_WEATHER_RAIN_FLAG];
+  tmp.solar_rad = s_holding_regs[MODBUS_HREG_WEATHER_SOLAR_RAD];
+  tmp.baro_press = s_holding_regs[MODBUS_HREG_WEATHER_BARO_PRESS];
+  tmp.dew_point = (int16_t)s_holding_regs[MODBUS_HREG_WEATHER_DEW_POINT];
+  tmp.status_bits = s_holding_regs[MODBUS_HREG_WEATHER_STATUS_BITS];
+  tmp.source_age_s = s_holding_regs[MODBUS_HREG_WEATHER_AGE_S];
+  local_token = s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN];
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+
+  *snapshot = tmp;
+  *token = local_token;
+  return true;
+}
+
+static bool weather_payload_equal(const weather_snapshot_t *lhs,
+                                  const weather_snapshot_t *rhs) {
+  if (lhs == NULL || rhs == NULL) {
+    return false;
+  }
+
+  return lhs->out_temp == rhs->out_temp && lhs->out_hum == rhs->out_hum &&
+         lhs->wind_speed == rhs->wind_speed && lhs->wind_dir == rhs->wind_dir &&
+         lhs->rain_flag == rhs->rain_flag && lhs->solar_rad == rhs->solar_rad &&
+         lhs->baro_press == rhs->baro_press && lhs->dew_point == rhs->dew_point &&
+         lhs->status_bits == rhs->status_bits;
+}
+
+static void log_weather_snapshot(const char *prefix, uint16_t token,
+                                 const weather_snapshot_t *snapshot) {
+  if (prefix == NULL || snapshot == NULL) {
+    return;
+  }
+
+  ESP_LOGI(TAG,
+           "%s token=%u out_temp=%.1fC out_hum=%.1f%% wind=%.1fm/s dir=%u "
+           "rain=%u solar=%uW/m2 baro=%.1fhPa dew=%.1fC status=0x%04X age=%us",
+           prefix, (unsigned)token, ((float)snapshot->out_temp) / 10.0f,
+           ((float)snapshot->out_hum) / 10.0f,
+           ((float)snapshot->wind_speed) / 10.0f,
+           (unsigned)snapshot->wind_dir, (unsigned)snapshot->rain_flag,
+           (unsigned)snapshot->solar_rad, ((float)snapshot->baro_press) / 10.0f,
+           ((float)snapshot->dew_point) / 10.0f,
+           (unsigned)snapshot->status_bits, (unsigned)snapshot->source_age_s);
+}
+
+static void queue_weather_sync_request_from_regs(void) {
+  weather_snapshot_t snapshot = {0};
+  uint16_t token = 0;
+  bool should_log_queued = false;
+  if (!load_weather_snapshot_from_regs(&snapshot, &token) || token == 0U) {
+    return;
+  }
+
+  taskENTER_CRITICAL(&s_state_lock);
+  bool same_as_last = (token == s_weather_last_token);
+  bool same_as_pending = (s_weather_sync_pending && token == s_weather_pending_token);
+  if (!same_as_last && !same_as_pending) {
+    s_weather_pending_token = token;
+    s_weather_pending_snapshot = snapshot;
+    s_weather_sync_pending = true;
+    should_log_queued = true;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (should_log_queued) {
+    log_weather_snapshot("Weather sync QUEUED", token, &snapshot);
+  }
+}
+
+static void finalize_weather_sync(uint16_t token,
+                                  modbus_weather_set_result_t result) {
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    s_holding_regs[MODBUS_HREG_WEATHER_SET_APPLIED_TOKEN] = token;
+    s_holding_regs[MODBUS_HREG_WEATHER_SET_RESULT] = (uint16_t)result;
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  }
+
+  taskENTER_CRITICAL(&s_state_lock);
+  s_weather_last_token = token;
+  s_weather_pending_token = 0;
+  s_weather_sync_pending = false;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  queue_weather_sync_request_from_regs();
+}
+
+static void process_pending_weather_sync(void) {
+  bool pending = false;
+  weather_snapshot_t pending_snapshot = {0};
+  weather_snapshot_t active_snapshot = {0};
+  bool weather_valid = false;
+  uint16_t token = 0;
+  uint32_t now = now_ms();
+
+  taskENTER_CRITICAL(&s_state_lock);
+  pending = s_weather_sync_pending;
+  if (pending) {
+    pending_snapshot = s_weather_pending_snapshot;
+    token = s_weather_pending_token;
+    active_snapshot = s_weather_active_snapshot;
+    weather_valid = s_weather_valid;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (!pending || token == 0U) {
+    return;
+  }
+
+  if (weather_valid && weather_payload_equal(&pending_snapshot, &active_snapshot)) {
+    log_weather_snapshot("Weather sync NOOP", token, &pending_snapshot);
+    taskENTER_CRITICAL(&s_state_lock);
+    s_weather_last_rx_ms = now;
+    s_weather_stale = false;
+    taskEXIT_CRITICAL(&s_state_lock);
+    finalize_weather_sync(token, MODBUS_WEATHER_SET_RESULT_NOOP);
+    return;
+  }
+
+  log_weather_snapshot("Weather sync APPLIED", token, &pending_snapshot);
+  taskENTER_CRITICAL(&s_state_lock);
+  s_weather_active_snapshot = pending_snapshot;
+  s_weather_valid = true;
+  s_weather_last_rx_ms = now;
+  s_weather_stale = false;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  finalize_weather_sync(token, MODBUS_WEATHER_SET_RESULT_APPLIED);
+}
+
 static bool decode_write_holding_span(uint8_t fc, const uint8_t *frame, uint16_t len,
                                       uint16_t *start_reg, uint16_t *reg_count) {
   if (frame == NULL || start_reg == NULL || reg_count == NULL) {
@@ -951,28 +1291,61 @@ static bool reg_span_intersects(uint16_t start_reg, uint16_t reg_count,
 }
 
 static void sync_staging_schedule_from_current_regs(void) {
-  light_period_cfg_t staging[MODBUS_LIGHT_MAX_PERIODS] = {0};
-  regs_to_light_schedule(s_holding_regs, staging);
+  light_control_cfg_t staging = {0};
+  light_control_cfg_t prev_staging = {0};
+  uint32_t now = now_ms();
+  regs_to_light_ctrl(s_holding_regs, &staging);
 
   taskENTER_CRITICAL(&s_state_lock);
-  memcpy(s_staging_schedule, staging, sizeof(s_staging_schedule));
+  prev_staging = s_staging_light_cfg;
+  s_staging_light_cfg = staging;
+  s_light_cfg_dirty = true;
+  s_light_cfg_last_change_ms = now;
   taskEXIT_CRITICAL(&s_state_lock);
+
+  if (!light_schedule_equal(&prev_staging.relay[0].schedule,
+                            &staging.relay[0].schedule)) {
+    log_light_schedule_cfg("Relay 1 schedule received",
+                           &staging.relay[0].schedule);
+  }
+  if (!light_schedule_equal(&prev_staging.relay[1].schedule,
+                            &staging.relay[1].schedule)) {
+    log_light_schedule_cfg("Relay 2 schedule received",
+                           &staging.relay[1].schedule);
+  }
+  log_light_ctrl_cfg("Light cfg received", &staging);
 }
 
 static void queue_apply_request_from_current_regs(void) {
-  light_period_cfg_t staging[MODBUS_LIGHT_MAX_PERIODS] = {0};
-  regs_to_light_schedule(s_holding_regs, staging);
-  s_holding_regs[MODBUS_HREG_APPLY_CMD] = MODBUS_APPLY_CMD_NONE;
+  light_control_cfg_t staging = {0};
+  light_control_cfg_t prev_staging = {0};
+  regs_to_light_ctrl(s_holding_regs, &staging);
 
   taskENTER_CRITICAL(&s_state_lock);
   bool was_pending = s_apply_pending;
-  memcpy(s_staging_schedule, staging, sizeof(s_staging_schedule));
-  memcpy(s_apply_pending_schedule, staging, sizeof(s_apply_pending_schedule));
+  prev_staging = s_staging_light_cfg;
+  s_staging_light_cfg = staging;
+  s_apply_pending_light_cfg = staging;
   s_apply_pending = true;
+  s_light_cfg_dirty = false;
+  s_light_cfg_last_change_ms = 0U;
   if (was_pending && s_apply_fail_busy_count < UINT32_MAX) {
     s_apply_fail_busy_count++;
   }
   taskEXIT_CRITICAL(&s_state_lock);
+
+  if (!light_schedule_equal(&prev_staging.relay[0].schedule,
+                            &staging.relay[0].schedule)) {
+    log_light_schedule_cfg("Relay 1 schedule received",
+                           &staging.relay[0].schedule);
+  }
+  if (!light_schedule_equal(&prev_staging.relay[1].schedule,
+                            &staging.relay[1].schedule)) {
+    log_light_schedule_cfg("Relay 2 schedule received",
+                           &staging.relay[1].schedule);
+  }
+  ESP_LOGI(TAG, "Light cfg auto-queued from registers 110..122");
+  log_light_ctrl_cfg("Light cfg queued for apply", &staging);
 }
 
 static mb_exception_t invoke_wrapped_handler(uint8_t fc, void *ctx, uint8_t *frame,
@@ -1028,19 +1401,30 @@ static mb_exception_t modbus_fc_06_wrapper(void *ctx, uint8_t *frame,
   uint16_t alt_start_reg = (start_reg > 0U) ? (uint16_t)(start_reg - 1U) : start_reg;
   bool writes_schedule =
       has_span &&
-      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
-                           MODBUS_HREG_SCH3_OFF_HHMM) ||
-       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
-                           MODBUS_HREG_SCH3_OFF_HHMM));
-  bool writes_apply =
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE,
+                           MODBUS_HREG_LIGHT_HYST_SEC) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE,
+                           MODBUS_HREG_LIGHT_HYST_SEC));
+  bool writes_full_light_cfg =
       has_span &&
-      (reg_span_contains(start_reg, reg_count, MODBUS_HREG_APPLY_CMD) ||
-       reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_APPLY_CMD));
+      ((reg_span_contains(start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE) &&
+        reg_span_contains(start_reg, reg_count, MODBUS_HREG_LIGHT_HYST_SEC)) ||
+       (reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE) &&
+        reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_HYST_SEC)));
+  bool writes_weather =
+      has_span &&
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
+                           MODBUS_HREG_WEATHER_SET_TOKEN) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
+                           MODBUS_HREG_WEATHER_SET_TOKEN));
 
   mb_exception_t ex = invoke_wrapped_handler(0x06, ctx, frame, len_buf);
   if (ex == 0) {
     queue_rtc_sync_request_from_regs();
-    if (writes_apply) {
+    if (writes_weather) {
+      queue_weather_sync_request_from_regs();
+    }
+    if (writes_full_light_cfg) {
       queue_apply_request_from_current_regs();
     } else if (writes_schedule) {
       sync_staging_schedule_from_current_regs();
@@ -1063,19 +1447,30 @@ static mb_exception_t modbus_fc_10_wrapper(void *ctx, uint8_t *frame,
   uint16_t alt_start_reg = (start_reg > 0U) ? (uint16_t)(start_reg - 1U) : start_reg;
   bool writes_schedule =
       has_span &&
-      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
-                           MODBUS_HREG_SCH3_OFF_HHMM) ||
-       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
-                           MODBUS_HREG_SCH3_OFF_HHMM));
-  bool writes_apply =
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE,
+                           MODBUS_HREG_LIGHT_HYST_SEC) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE,
+                           MODBUS_HREG_LIGHT_HYST_SEC));
+  bool writes_full_light_cfg =
       has_span &&
-      (reg_span_contains(start_reg, reg_count, MODBUS_HREG_APPLY_CMD) ||
-       reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_APPLY_CMD));
+      ((reg_span_contains(start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE) &&
+        reg_span_contains(start_reg, reg_count, MODBUS_HREG_LIGHT_HYST_SEC)) ||
+       (reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE) &&
+        reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_HYST_SEC)));
+  bool writes_weather =
+      has_span &&
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
+                           MODBUS_HREG_WEATHER_SET_TOKEN) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
+                           MODBUS_HREG_WEATHER_SET_TOKEN));
 
   mb_exception_t ex = invoke_wrapped_handler(0x10, ctx, frame, len_buf);
   if (ex == 0) {
     queue_rtc_sync_request_from_regs();
-    if (writes_apply) {
+    if (writes_weather) {
+      queue_weather_sync_request_from_regs();
+    }
+    if (writes_full_light_cfg) {
       queue_apply_request_from_current_regs();
     } else if (writes_schedule) {
       sync_staging_schedule_from_current_regs();
@@ -1098,19 +1493,30 @@ static mb_exception_t modbus_fc_17_wrapper(void *ctx, uint8_t *frame,
   uint16_t alt_start_reg = (start_reg > 0U) ? (uint16_t)(start_reg - 1U) : start_reg;
   bool writes_schedule =
       has_span &&
-      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
-                           MODBUS_HREG_SCH3_OFF_HHMM) ||
-       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_SCH0_ENABLE,
-                           MODBUS_HREG_SCH3_OFF_HHMM));
-  bool writes_apply =
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE,
+                           MODBUS_HREG_LIGHT_HYST_SEC) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE,
+                           MODBUS_HREG_LIGHT_HYST_SEC));
+  bool writes_full_light_cfg =
       has_span &&
-      (reg_span_contains(start_reg, reg_count, MODBUS_HREG_APPLY_CMD) ||
-       reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_APPLY_CMD));
+      ((reg_span_contains(start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE) &&
+        reg_span_contains(start_reg, reg_count, MODBUS_HREG_LIGHT_HYST_SEC)) ||
+       (reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_R1_ENABLE) &&
+        reg_span_contains(alt_start_reg, reg_count, MODBUS_HREG_LIGHT_HYST_SEC)));
+  bool writes_weather =
+      has_span &&
+      (reg_span_intersects(start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
+                           MODBUS_HREG_WEATHER_SET_TOKEN) ||
+       reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
+                           MODBUS_HREG_WEATHER_SET_TOKEN));
 
   mb_exception_t ex = invoke_wrapped_handler(0x17, ctx, frame, len_buf);
   if (ex == 0) {
     queue_rtc_sync_request_from_regs();
-    if (writes_apply) {
+    if (writes_weather) {
+      queue_weather_sync_request_from_regs();
+    }
+    if (writes_full_light_cfg) {
       queue_apply_request_from_current_regs();
     } else if (writes_schedule) {
       sync_staging_schedule_from_current_regs();
@@ -1151,27 +1557,56 @@ static void queue_apply_request_from_regs(void) {
     return;
   }
 
-  light_period_cfg_t staging[MODBUS_LIGHT_MAX_PERIODS] = {0};
-  uint16_t apply_cmd = MODBUS_APPLY_CMD_NONE;
+  light_control_cfg_t staging = {0};
+  light_control_cfg_t prev_staging = {0};
+  bool staging_changed = false;
+  bool auto_apply = false;
+  uint32_t now = now_ms();
   ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-  regs_to_light_schedule(s_holding_regs, staging);
-  apply_cmd = s_holding_regs[MODBUS_HREG_APPLY_CMD];
-  if (apply_cmd != MODBUS_APPLY_CMD_NONE) {
-    s_holding_regs[MODBUS_HREG_APPLY_CMD] = MODBUS_APPLY_CMD_NONE;
-  }
+  regs_to_light_ctrl(s_holding_regs, &staging);
   ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
 
   taskENTER_CRITICAL(&s_state_lock);
-  memcpy(s_staging_schedule, staging, sizeof(s_staging_schedule));
-  if (apply_cmd != MODBUS_APPLY_CMD_NONE) {
+  prev_staging = s_staging_light_cfg;
+  if (!light_ctrl_equal(&prev_staging, &staging)) {
+    s_staging_light_cfg = staging;
+    s_light_cfg_dirty = true;
+    s_light_cfg_last_change_ms = now;
+    staging_changed = true;
+  } else if (s_light_cfg_dirty &&
+             (uint32_t)(now - s_light_cfg_last_change_ms) >=
+                 MODBUS_LIGHT_AUTO_APPLY_SETTLE_MS) {
     bool was_pending = s_apply_pending;
-    memcpy(s_apply_pending_schedule, staging, sizeof(s_apply_pending_schedule));
+    s_apply_pending_light_cfg = staging;
     s_apply_pending = true;
+    s_light_cfg_dirty = false;
+    s_light_cfg_last_change_ms = 0U;
+    auto_apply = true;
     if (was_pending && s_apply_fail_busy_count < UINT32_MAX) {
       s_apply_fail_busy_count++;
     }
   }
   taskEXIT_CRITICAL(&s_state_lock);
+
+  if (staging_changed) {
+    if (!light_schedule_equal(&prev_staging.relay[0].schedule,
+                              &staging.relay[0].schedule)) {
+      log_light_schedule_cfg("Relay 1 schedule received",
+                             &staging.relay[0].schedule);
+    }
+    if (!light_schedule_equal(&prev_staging.relay[1].schedule,
+                              &staging.relay[1].schedule)) {
+      log_light_schedule_cfg("Relay 2 schedule received",
+                             &staging.relay[1].schedule);
+    }
+    log_light_ctrl_cfg("Light cfg received", &staging);
+  }
+
+  if (auto_apply) {
+    ESP_LOGI(TAG, "Light cfg auto-queued after %u ms settle",
+             (unsigned)MODBUS_LIGHT_AUTO_APPLY_SETTLE_MS);
+    log_light_ctrl_cfg("Light cfg queued for apply", &staging);
+  }
 }
 
 static void finalize_apply_result(modbus_apply_status_t status) {
@@ -1206,15 +1641,15 @@ static void finalize_apply_result(modbus_apply_status_t status) {
 }
 
 static modbus_apply_status_t apply_control_block(
-    const light_period_cfg_t *candidate_schedule) {
+    const light_control_cfg_t *candidate_cfg) {
   if (s_mbc_slave_handler == NULL) {
     return MODBUS_APPLY_ERR_INTERNAL;
   }
-  if (candidate_schedule == NULL) {
+  if (candidate_cfg == NULL) {
     return MODBUS_APPLY_ERR_INTERNAL;
   }
 
-  if (!validate_light_schedule(candidate_schedule)) {
+  if (!validate_light_ctrl(candidate_cfg)) {
     return MODBUS_APPLY_ERR_RANGE;
   }
 
@@ -1223,15 +1658,12 @@ static modbus_apply_status_t apply_control_block(
   next_version = s_active_ctrl_version + 1U;
   taskEXIT_CRITICAL(&s_state_lock);
 
-  if (!persist_light_state(candidate_schedule, next_version)) {
+  if (!persist_light_state(candidate_cfg, next_version)) {
     return MODBUS_APPLY_ERR_INTERNAL;
   }
 
   taskENTER_CRITICAL(&s_state_lock);
-  memcpy(s_active_schedule, candidate_schedule, sizeof(s_active_schedule));
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    s_remote_active_cfg.periods[i] = candidate_schedule[i];
-  }
+  s_active_light_cfg = *candidate_cfg;
   s_active_ctrl_version = next_version;
   taskEXIT_CRITICAL(&s_state_lock);
 
@@ -1243,14 +1675,9 @@ static modbus_apply_status_t apply_control_block(
   s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_LO] = ver_lo;
   ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
 
-  ESP_LOGI(TAG, "Light schedule applied: active_ctrl_version=%lu",
+  ESP_LOGI(TAG, "Light config applied: active_ctrl_version=%lu",
            (unsigned long)next_version);
-  for (int i = 0; i < MODBUS_LIGHT_MAX_PERIODS; ++i) {
-    ESP_LOGI(TAG, "Light schedule slot %d: EN=%u ON=%04u OFF=%04u", i,
-             (unsigned)candidate_schedule[i].enable,
-             (unsigned)candidate_schedule[i].on_hhmm,
-             (unsigned)candidate_schedule[i].off_hhmm);
-  }
+  log_light_ctrl_cfg("Light cfg applied", candidate_cfg);
 
   return MODBUS_APPLY_OK;
 }
@@ -1266,26 +1693,36 @@ static void modbus_runtime_task(void *arg) {
     // Fallback polling path: detect RTC token writes even if FC wrappers were not hit.
     queue_rtc_sync_request_from_regs();
     process_pending_rtc_sync();
+    queue_weather_sync_request_from_regs();
+    process_pending_weather_sync();
     queue_apply_request_from_regs();
 
-    light_period_cfg_t pending_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+    light_control_cfg_t pending_light_cfg = {0};
     bool has_pending_apply = false;
     taskENTER_CRITICAL(&s_state_lock);
     has_pending_apply = s_apply_pending;
     if (has_pending_apply) {
-      memcpy(pending_schedule, s_apply_pending_schedule, sizeof(pending_schedule));
+      pending_light_cfg = s_apply_pending_light_cfg;
       s_apply_pending = false;
     }
     taskEXIT_CRITICAL(&s_state_lock);
 
     if (has_pending_apply) {
-      modbus_apply_status_t status = apply_control_block(pending_schedule);
+      modbus_apply_status_t status = apply_control_block(&pending_light_cfg);
       finalize_apply_result(status);
     }
 
     uint32_t now = now_ms();
     taskENTER_CRITICAL(&s_state_lock);
     bool entered_autonomous = false;
+    if (s_weather_valid) {
+      uint32_t weather_elapsed = now - s_weather_last_rx_ms;
+      s_weather_stale =
+          (weather_elapsed > MODBUS_WEATHER_STALE_TIMEOUT_MS) ||
+          (s_weather_active_snapshot.source_age_s > MODBUS_WEATHER_MAX_SOURCE_AGE_S);
+    } else {
+      s_weather_stale = true;
+    }
     if (s_mode_state == MODBUS_MODE_REMOTE) {
       uint32_t elapsed = now - s_last_master_seen_ms;
       if (elapsed > MODBUS_HEARTBEAT_TIMEOUT_MS) {
@@ -1338,25 +1775,27 @@ void modbus_init(void) {
 
   memset(s_holding_regs, 0, sizeof(s_holding_regs));
   remote_cfg_to_regs(&s_remote_active_cfg, s_holding_regs);
-  light_schedule_to_regs(s_staging_schedule, s_holding_regs);
+  light_ctrl_to_regs(&s_staging_light_cfg, s_holding_regs);
   uint16_t ver_hi = 0;
   uint16_t ver_lo = 0;
   u32_to_regs(s_active_ctrl_version, &ver_hi, &ver_lo);
   s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_HI] = ver_hi;
   s_holding_regs[MODBUS_HREG_ACTIVE_CTRL_VERSION_LO] = ver_lo;
-  s_holding_regs[MODBUS_HREG_SOLAR_RADIATION_X10] = 0;
-  s_holding_regs[MODBUS_HREG_SOLAR_UPPER_THRESHOLD_X10] =
-      MODBUS_SOLAR_DEFAULT_THRESHOLD_X10;
-  s_holding_regs[MODBUS_HREG_LIGHT_REDUCTION_ACTIVE] = 0;
+  s_holding_regs[MODBUS_HREG_LIGHT_CURRENT_DLI_JCM2] = 0;
+  s_holding_regs[MODBUS_HREG_LIGHT_OUTPUT_PERCENT] = 0;
+  s_holding_regs[MODBUS_HREG_LIGHT_STATUS_BITS] = 0;
   s_holding_regs[MODBUS_HREG_RTC_SET_HOUR] = 0;
   s_holding_regs[MODBUS_HREG_RTC_SET_MINUTE] = 0;
   s_holding_regs[MODBUS_HREG_RTC_SET_TOKEN] = 0;
   s_holding_regs[MODBUS_HREG_RTC_SET_APPLIED_TOKEN] = 0;
   s_holding_regs[MODBUS_HREG_RTC_SET_RESULT] = MODBUS_RTC_SET_RESULT_NONE;
+  s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN] = 0;
+  s_holding_regs[MODBUS_HREG_WEATHER_SET_APPLIED_TOKEN] = 0;
+  s_holding_regs[MODBUS_HREG_WEATHER_SET_RESULT] = MODBUS_WEATHER_SET_RESULT_NONE;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_apply_pending = false;
-  memset(s_apply_pending_schedule, 0, sizeof(s_apply_pending_schedule));
+  memset(&s_apply_pending_light_cfg, 0, sizeof(s_apply_pending_light_cfg));
   s_apply_ok_count = 0;
   s_apply_fail_invalid_count = 0;
   s_apply_fail_busy_count = 0;
@@ -1365,6 +1804,15 @@ void modbus_init(void) {
   s_last_apply_ts_ms = 0;
   s_last_logged_schedule_mask = UINT8_MAX;
   s_last_logged_schedule_mode = UINT8_MAX;
+  s_last_logged_light_output_percent = UINT16_MAX;
+  s_last_logged_light_status_bits = UINT16_MAX;
+  s_light_stable_on_mask = 0U;
+  s_light_pending_valid_mask = 0U;
+  s_light_pending_target_on_mask = 0U;
+  memset((void *)s_light_pending_since_ms, 0, sizeof(s_light_pending_since_ms));
+  memset((void *)s_light_on_delay_since_ms, 0, sizeof(s_light_on_delay_since_ms));
+  s_light_cfg_dirty = false;
+  s_light_cfg_last_change_ms = 0U;
   s_last_master_seen_ms = now_ms();
   s_light_set_ms = s_last_master_seen_ms;
   s_good_cycle_streak = 0;
@@ -1380,6 +1828,14 @@ void modbus_init(void) {
   s_rtc_sync_fail_count = 0;
   s_rtc_sync_reject_count = 0;
   s_rtc_sync_last_result = MODBUS_RTC_SET_RESULT_NONE;
+  s_weather_last_token = 0;
+  s_weather_pending_token = 0;
+  s_weather_sync_pending = false;
+  memset(&s_weather_pending_snapshot, 0, sizeof(s_weather_pending_snapshot));
+  memset(&s_weather_active_snapshot, 0, sizeof(s_weather_active_snapshot));
+  s_weather_last_rx_ms = 0;
+  s_weather_valid = false;
+  s_weather_stale = true;
 
   update_diag_regs_locked();
 
@@ -1397,6 +1853,9 @@ void modbus_init(void) {
   xTaskCreate(modbus_runtime_task, "mb_runtime", 4096, NULL, 6, NULL);
 
   ESP_LOGI(TAG, "Modbus slave initialized (id=%u, UART2, 19200 8N1)",
+           (unsigned)s_slave_id);
+  ESP_LOGI(TAG, "Light relay turn-on delay=%u s (zone_id=slave_id=%u)",
+           (unsigned)((uint32_t)s_slave_id * MODBUS_LIGHT_ZONE_DELAY_STEP_SEC),
            (unsigned)s_slave_id);
 }
 
@@ -1462,76 +1921,209 @@ uint8_t modbus_get_light_percent(void) {
 }
 
 void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on) {
-  bool out1 = false;
-  bool out2 = false;
-  bool reduction = false;
-  light_period_cfg_t effective_schedule[MODBUS_LIGHT_MAX_PERIODS] = {0};
+  bool relay_out[MODBUS_LIGHT_RELAY_COUNT] = {false, false};
+  light_control_cfg_t active_light_cfg = {0};
+  light_control_cfg_t effective_light_cfg = {0};
   modbus_mode_state_t mode = MODBUS_MODE_REMOTE;
   uint8_t light_hour = 0;
   uint8_t light_minute = 0;
   uint8_t light_second = 0;
   uint32_t light_set_ms = 0;
+  uint8_t prev_stable_on_mask = 0U;
+  uint8_t prev_pending_valid_mask = 0U;
+  uint8_t prev_pending_target_on_mask = 0U;
+  uint32_t prev_pending_since_ms[MODBUS_LIGHT_RELAY_COUNT] = {0};
+  uint32_t prev_on_delay_since_ms[MODBUS_LIGHT_RELAY_COUNT] = {0};
+  uint16_t radiation_wm2 = 0;
+  bool weather_stale = true;
+  uint16_t status_bits = 0;
+  uint8_t next_stable_on_mask = 0U;
+  uint8_t next_pending_valid_mask = 0U;
+  uint8_t next_pending_target_on_mask = 0U;
+  uint32_t next_pending_since_ms[MODBUS_LIGHT_RELAY_COUNT] = {0};
+  uint32_t next_on_delay_since_ms[MODBUS_LIGHT_RELAY_COUNT] = {0};
+  uint32_t cycle_now_ms = now_ms();
+  uint32_t sec_of_day = 0U;
+  uint16_t dli_current = 0U;
+  uint32_t zone_turn_on_delay_sec = 0U;
 
   taskENTER_CRITICAL(&s_state_lock);
   mode = s_mode_state;
+  active_light_cfg = s_active_light_cfg;
+  effective_light_cfg = active_light_cfg;
   if (mode == MODBUS_MODE_AUTONOMOUS) {
-    memcpy(effective_schedule, s_autonomous_cfg.periods, sizeof(effective_schedule));
-  } else {
-    memcpy(effective_schedule, s_active_schedule, sizeof(effective_schedule));
+    effective_light_cfg.relay[0].schedule = s_autonomous_cfg.periods[0];
+    effective_light_cfg.relay[1].schedule = s_autonomous_cfg.periods[0];
   }
   light_hour = s_light_hour;
   light_minute = s_light_minute;
   light_second = s_light_second;
   light_set_ms = s_light_set_ms;
+  prev_stable_on_mask = s_light_stable_on_mask;
+  prev_pending_valid_mask = s_light_pending_valid_mask;
+  prev_pending_target_on_mask = s_light_pending_target_on_mask;
+  memcpy(prev_pending_since_ms, (const void *)s_light_pending_since_ms,
+         sizeof(prev_pending_since_ms));
+  memcpy(prev_on_delay_since_ms, (const void *)s_light_on_delay_since_ms,
+         sizeof(prev_on_delay_since_ms));
+  radiation_wm2 = s_weather_active_snapshot.solar_rad;
+  weather_stale = (!s_weather_valid || s_weather_stale);
+  zone_turn_on_delay_sec =
+      (uint32_t)s_slave_id * MODBUS_LIGHT_ZONE_DELAY_STEP_SEC;
   taskEXIT_CRITICAL(&s_state_lock);
 
   if (light_hour <= 23U && light_minute <= 59U && light_second <= 59U) {
     uint32_t base_sec =
         (uint32_t)light_hour * 3600U + (uint32_t)light_minute * 60U + (uint32_t)light_second;
-    uint32_t elapsed_sec = (now_ms() - light_set_ms) / 1000U;
-    uint32_t sec_of_day = (base_sec + elapsed_sec) % 86400U;
+    uint32_t elapsed_sec = (cycle_now_ms - light_set_ms) / 1000U;
+    sec_of_day = (base_sec + elapsed_sec) % 86400U;
     uint16_t minute_of_day = (uint16_t)(sec_of_day / 60U);
-    uint8_t active_mask = get_active_schedule_mask(effective_schedule, minute_of_day);
-    bool schedule_active = (active_mask != 0U);
+    uint8_t active_mask =
+        get_active_light_schedule_mask(&effective_light_cfg, minute_of_day);
 
-    log_active_light_schedules_if_changed(effective_schedule, mode, minute_of_day,
-                                          active_mask);
+    log_active_light_schedules_if_changed(&effective_light_cfg, mode,
+                                          minute_of_day, active_mask);
 
-    if (schedule_active) {
-      uint16_t radiation_x10 = 0;
-      uint16_t threshold_x10 = MODBUS_SOLAR_DEFAULT_THRESHOLD_X10;
+    if (weather_stale) {
+      status_bits |= MODBUS_LIGHT_STATUS_WEATHER_STALE;
+    }
 
-      if (s_mbc_slave_handler != NULL) {
-        ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-        radiation_x10 = s_holding_regs[MODBUS_HREG_SOLAR_RADIATION_X10];
-        threshold_x10 = s_holding_regs[MODBUS_HREG_SOLAR_UPPER_THRESHOLD_X10];
-        ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+    if (s_mbc_slave_handler != NULL) {
+      ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+      dli_current = s_holding_regs[MODBUS_HREG_LIGHT_CURRENT_DLI_JCM2];
+      ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+    }
+
+    for (int i = 0; i < MODBUS_LIGHT_RELAY_COUNT; ++i) {
+      const light_relay_cfg_t *relay_cfg = &effective_light_cfg.relay[i];
+      uint8_t relay_bit = (uint8_t)(1U << i);
+      bool schedule_active = (active_mask & relay_bit) != 0U;
+      bool prev_stable_on = (prev_stable_on_mask & relay_bit) != 0U;
+      bool prev_pending_valid = (prev_pending_valid_mask & relay_bit) != 0U;
+      bool prev_pending_target_on =
+          (prev_pending_target_on_mask & relay_bit) != 0U;
+      bool stable_on = prev_stable_on;
+      bool dli_limit_active = false;
+      bool hyst_hold = false;
+      bool raw_target_valid = false;
+      bool raw_target_on = prev_stable_on;
+
+      if (schedule_active) {
+        status_bits |= (i == 0) ? MODBUS_LIGHT_STATUS_R1_SCHEDULE_ACTIVE
+                                : MODBUS_LIGHT_STATUS_R2_SCHEDULE_ACTIVE;
       }
 
-      if (threshold_x10 > 0U && radiation_x10 >= threshold_x10) {
-        // Upper radiation threshold reached: switch one relay off (50% light).
-        out1 = true;
-        out2 = false;
-        reduction = true;
+      if (!schedule_active) {
+        stable_on = false;
+      } else if (relay_cfg->dli_off_limit_jcm2 > 0U &&
+                 dli_current >= relay_cfg->dli_off_limit_jcm2) {
+        dli_limit_active = true;
+        stable_on = false;
+      } else if (relay_cfg->threshold_wm2 == 0U ||
+                 radiation_wm2 < relay_cfg->threshold_wm2) {
+        raw_target_valid = true;
+        raw_target_on = true;
       } else {
-        // Inside schedule and radiation below threshold: full light.
-        out1 = true;
-        out2 = true;
+        raw_target_valid = true;
+        raw_target_on = false;
+      }
+
+      if (dli_limit_active) {
+        next_pending_since_ms[i] = 0U;
+      } else if (raw_target_valid) {
+        if (active_light_cfg.hyst_sec == 0U) {
+          stable_on = raw_target_on;
+          next_pending_since_ms[i] = 0U;
+        } else if (raw_target_on == prev_stable_on) {
+          stable_on = raw_target_on;
+          next_pending_since_ms[i] = 0U;
+        } else if (!prev_pending_valid || prev_pending_target_on != raw_target_on) {
+          stable_on = prev_stable_on;
+          next_pending_valid_mask |= relay_bit;
+          if (raw_target_on) {
+            next_pending_target_on_mask |= relay_bit;
+          }
+          next_pending_since_ms[i] = cycle_now_ms;
+          hyst_hold = true;
+        } else if ((cycle_now_ms - prev_pending_since_ms[i]) <
+                   ((uint32_t)active_light_cfg.hyst_sec * 1000U)) {
+          stable_on = prev_stable_on;
+          next_pending_valid_mask |= relay_bit;
+          if (prev_pending_target_on) {
+            next_pending_target_on_mask |= relay_bit;
+          }
+          next_pending_since_ms[i] = prev_pending_since_ms[i];
+          hyst_hold = true;
+        } else {
+          stable_on = raw_target_on;
+          next_pending_since_ms[i] = 0U;
+        }
+      } else {
+        next_pending_since_ms[i] = 0U;
+      }
+
+      if (stable_on) {
+        next_stable_on_mask |= relay_bit;
+        if (!prev_stable_on || prev_on_delay_since_ms[i] == 0U) {
+          next_on_delay_since_ms[i] = cycle_now_ms;
+        } else {
+          next_on_delay_since_ms[i] = prev_on_delay_since_ms[i];
+        }
+
+        if (zone_turn_on_delay_sec > 0U &&
+            (cycle_now_ms - next_on_delay_since_ms[i]) <
+                (zone_turn_on_delay_sec * 1000U)) {
+          status_bits |= (i == 0) ? MODBUS_LIGHT_STATUS_R1_ON_DELAY_ACTIVE
+                                  : MODBUS_LIGHT_STATUS_R2_ON_DELAY_ACTIVE;
+        } else {
+          relay_out[i] = true;
+        }
+      } else {
+        next_on_delay_since_ms[i] = 0U;
+      }
+
+      if (dli_limit_active) {
+        status_bits |= (i == 0) ? MODBUS_LIGHT_STATUS_R1_DLI_LIMIT
+                                : MODBUS_LIGHT_STATUS_R2_DLI_LIMIT;
+      }
+      if (hyst_hold) {
+        status_bits |= (i == 0) ? MODBUS_LIGHT_STATUS_R1_HYST_HOLD
+                                : MODBUS_LIGHT_STATUS_R2_HYST_HOLD;
+      }
+      if (relay_out[i]) {
+        status_bits |= (i == 0) ? MODBUS_LIGHT_STATUS_R1_OUTPUT_ON
+                                : MODBUS_LIGHT_STATUS_R2_OUTPUT_ON;
       }
     }
   }
 
+  taskENTER_CRITICAL(&s_state_lock);
+  s_light_stable_on_mask = next_stable_on_mask;
+  s_light_pending_valid_mask = next_pending_valid_mask;
+  s_light_pending_target_on_mask = next_pending_target_on_mask;
+  memcpy((void *)s_light_pending_since_ms, next_pending_since_ms,
+         sizeof(s_light_pending_since_ms));
+  memcpy((void *)s_light_on_delay_since_ms, next_on_delay_since_ms,
+         sizeof(s_light_on_delay_since_ms));
+  taskEXIT_CRITICAL(&s_state_lock);
+
   if (s_mbc_slave_handler != NULL) {
+    uint16_t output_percent =
+        (uint16_t)(((relay_out[0] ? 1U : 0U) + (relay_out[1] ? 1U : 0U)) * 50U);
     ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-    s_holding_regs[MODBUS_HREG_LIGHT_REDUCTION_ACTIVE] = reduction ? 1U : 0U;
+    s_holding_regs[MODBUS_HREG_LIGHT_OUTPUT_PERCENT] = output_percent;
+    s_holding_regs[MODBUS_HREG_LIGHT_STATUS_BITS] = status_bits;
     ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+    log_light_runtime_state_if_changed(sec_of_day, radiation_wm2, dli_current,
+                                       output_percent, status_bits,
+                                       relay_out[0], relay_out[1]);
   }
 
   if (relay1_on != NULL) {
-    *relay1_on = out1;
+    *relay1_on = relay_out[0];
   }
   if (relay2_on != NULL) {
-    *relay2_on = out2;
+    *relay2_on = relay_out[1];
   }
 }
 
@@ -1539,9 +2131,21 @@ void modbus_set_solar_radiation(float radiation) {
   if (s_mbc_slave_handler == NULL) {
     return;
   }
-  uint16_t radiation_x10 = float_to_u16_tenths(radiation, 0.0f, 6553.5f);
+  if (radiation < 0.0f) {
+    radiation = 0.0f;
+  } else if (radiation > 65535.0f) {
+    radiation = 65535.0f;
+  }
+  uint16_t radiation_wm2 = (uint16_t)(radiation + 0.5f);
+  uint32_t now = now_ms();
+  taskENTER_CRITICAL(&s_state_lock);
+  s_weather_active_snapshot.solar_rad = radiation_wm2;
+  s_weather_last_rx_ms = now;
+  s_weather_valid = true;
+  s_weather_stale = false;
+  taskEXIT_CRITICAL(&s_state_lock);
   ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-  s_holding_regs[MODBUS_HREG_SOLAR_RADIATION_X10] = radiation_x10;
+  s_holding_regs[MODBUS_HREG_WEATHER_SOLAR_RAD] = radiation_wm2;
   ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
 }
 
