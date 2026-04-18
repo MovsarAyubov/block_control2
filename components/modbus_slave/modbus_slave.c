@@ -9,7 +9,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include <ctype.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -50,7 +53,9 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
 #define MODBUS_NVS_KEY_REMOTE_CFG "remote_cfg"
+#define MODBUS_NVS_KEY_AUTONOMOUS_CFG "auto_cfg"
 #define MODBUS_NVS_KEY_LIGHT_STATE "light_state"
+#define MODBUS_AUTONOMOUS_CFG_MAGIC 0x4D424143U // MBAC
 #define MODBUS_LIGHT_STATE_MAGIC 0x4D424C53U // MBLS
 
 #define MODBUS_DEFAULT_SLAVE_ID 1U
@@ -89,9 +94,26 @@ typedef struct {
 } remote_ctrl_cfg_t;
 
 typedef struct {
+  uint16_t windows_pos_a_target;
+  uint16_t windows_pos_b_target;
+  uint16_t curtain_pos_target;
+  uint16_t sp_water_rail;
+  uint16_t sp_water_grow;
+  uint16_t sp_water_upper;
+  uint16_t sp_water_undertray;
+  light_control_cfg_t light;
+} autonomous_ctrl_cfg_t;
+
+typedef struct {
   uint32_t magic;
   remote_ctrl_cfg_t cfg;
 } persisted_remote_cfg_t;
+
+typedef struct {
+  uint32_t magic;
+  autonomous_ctrl_cfg_t cfg;
+  uint32_t crc32;
+} persisted_autonomous_cfg_t;
 
 typedef struct {
   uint32_t magic;
@@ -188,8 +210,8 @@ static void *s_rtc_cb_ctx = NULL;
 static uint8_t s_slave_id = MODBUS_DEFAULT_SLAVE_ID;
 static remote_ctrl_cfg_t s_remote_active_cfg = {0};
 
-static const remote_ctrl_cfg_t s_autonomous_cfg = {
-    .ctrl_version = 0,
+static const remote_ctrl_cfg_t s_remote_cfg_default = {
+    .ctrl_version = 1,
     .windows_pos_a_target = 0,
     .windows_pos_b_target = 0,
     .curtain_pos_target = 1000,
@@ -199,6 +221,35 @@ static const remote_ctrl_cfg_t s_autonomous_cfg = {
     .sp_water_undertray = 300,
     .periods = {{1, 600, 2200}},
 };
+
+static const autonomous_ctrl_cfg_t s_autonomous_cfg_default = {
+    .windows_pos_a_target = 0,
+    .windows_pos_b_target = 0,
+    .curtain_pos_target = 1000,
+    .sp_water_rail = 350,
+    .sp_water_grow = 320,
+    .sp_water_upper = 360,
+    .sp_water_undertray = 300,
+    .light =
+        {
+            .relay =
+                {
+                    {
+                        .schedule = {1, 600, 2200},
+                        .threshold_wm2 = 0,
+                        .dli_off_limit_jcm2 = 0,
+                    },
+                    {
+                        .schedule = {1, 600, 2200},
+                        .threshold_wm2 = 0,
+                        .dli_off_limit_jcm2 = 0,
+                    },
+                },
+            .hyst_sec = 0,
+        },
+};
+
+static autonomous_ctrl_cfg_t s_autonomous_cfg = {0};
 
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -252,6 +303,10 @@ static void log_active_light_schedules_if_changed(
     uint16_t minute_of_day, uint8_t active_mask);
 static modbus_apply_status_t apply_control_block(
     const light_control_cfg_t *candidate_cfg);
+static esp_err_t apply_ascii_autonomous_update(const autonomous_ctrl_cfg_t *cfg,
+                                               char *response,
+                                               size_t response_len,
+                                               const char *success_text);
 
 static modbus_handler_wrap_t s_handler_wraps[MODBUS_FC_COUNT] = {
     {.fc = 0x01, .original = NULL, .wrapper = modbus_fc_01_wrapper},
@@ -655,15 +710,188 @@ static void persist_remote_cfg(const remote_ctrl_cfg_t *cfg) {
   nvs_close(nvs);
 }
 
+static void autonomous_targets_to_remote_cfg(const autonomous_ctrl_cfg_t *src,
+                                             remote_ctrl_cfg_t *dst) {
+  if (src == NULL || dst == NULL) {
+    return;
+  }
+
+  memset(dst, 0, sizeof(*dst));
+  dst->windows_pos_a_target = src->windows_pos_a_target;
+  dst->windows_pos_b_target = src->windows_pos_b_target;
+  dst->curtain_pos_target = src->curtain_pos_target;
+  dst->sp_water_rail = src->sp_water_rail;
+  dst->sp_water_grow = src->sp_water_grow;
+  dst->sp_water_upper = src->sp_water_upper;
+  dst->sp_water_undertray = src->sp_water_undertray;
+}
+
+static void normalize_autonomous_cfg(autonomous_ctrl_cfg_t *cfg) {
+  if (cfg == NULL) {
+    return;
+  }
+
+  for (int i = 0; i < MODBUS_LIGHT_RELAY_COUNT; ++i) {
+    cfg->light.relay[i].threshold_wm2 = 0U;
+    cfg->light.relay[i].dli_off_limit_jcm2 = 0U;
+  }
+}
+
+static bool validate_autonomous_cfg(const autonomous_ctrl_cfg_t *cfg) {
+  if (cfg == NULL) {
+    return false;
+  }
+
+  remote_ctrl_cfg_t remote_view = {0};
+  autonomous_targets_to_remote_cfg(cfg, &remote_view);
+  return validate_remote_cfg(&remote_view) && validate_light_ctrl(&cfg->light);
+}
+
+static uint32_t compute_autonomous_cfg_crc32(const autonomous_ctrl_cfg_t *cfg) {
+  uint32_t crc = 0U;
+  crc = crc32_update(crc, (const uint8_t *)&cfg->windows_pos_a_target,
+                     sizeof(cfg->windows_pos_a_target));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->windows_pos_b_target,
+                     sizeof(cfg->windows_pos_b_target));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->curtain_pos_target,
+                     sizeof(cfg->curtain_pos_target));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->sp_water_rail,
+                     sizeof(cfg->sp_water_rail));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->sp_water_grow,
+                     sizeof(cfg->sp_water_grow));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->sp_water_upper,
+                     sizeof(cfg->sp_water_upper));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->sp_water_undertray,
+                     sizeof(cfg->sp_water_undertray));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[0].schedule.enable,
+                     sizeof(cfg->light.relay[0].schedule.enable));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[0].schedule.on_hhmm,
+                     sizeof(cfg->light.relay[0].schedule.on_hhmm));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[0].schedule.off_hhmm,
+                     sizeof(cfg->light.relay[0].schedule.off_hhmm));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->light.relay[0].threshold_wm2,
+                     sizeof(cfg->light.relay[0].threshold_wm2));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[0].dli_off_limit_jcm2,
+                     sizeof(cfg->light.relay[0].dli_off_limit_jcm2));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[1].schedule.enable,
+                     sizeof(cfg->light.relay[1].schedule.enable));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[1].schedule.on_hhmm,
+                     sizeof(cfg->light.relay[1].schedule.on_hhmm));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[1].schedule.off_hhmm,
+                     sizeof(cfg->light.relay[1].schedule.off_hhmm));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->light.relay[1].threshold_wm2,
+                     sizeof(cfg->light.relay[1].threshold_wm2));
+  crc = crc32_update(crc,
+                     (const uint8_t *)&cfg->light.relay[1].dli_off_limit_jcm2,
+                     sizeof(cfg->light.relay[1].dli_off_limit_jcm2));
+  crc = crc32_update(crc, (const uint8_t *)&cfg->light.hyst_sec,
+                     sizeof(cfg->light.hyst_sec));
+  return crc;
+}
+
+static void set_default_autonomous_cfg(void) {
+  s_autonomous_cfg = s_autonomous_cfg_default;
+  normalize_autonomous_cfg(&s_autonomous_cfg);
+}
+
+static bool persist_autonomous_cfg(const autonomous_ctrl_cfg_t *cfg) {
+  if (cfg == NULL) {
+    return false;
+  }
+
+  nvs_handle_t nvs = 0;
+  esp_err_t err = nvs_open(MODBUS_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "NVS open failed while saving autonomous cfg: %s",
+             esp_err_to_name(err));
+    return false;
+  }
+
+  persisted_autonomous_cfg_t blob = {
+      .magic = MODBUS_AUTONOMOUS_CFG_MAGIC,
+      .cfg = *cfg,
+      .crc32 = compute_autonomous_cfg_crc32(cfg),
+  };
+
+  err = nvs_set_blob(nvs, MODBUS_NVS_KEY_AUTONOMOUS_CFG, &blob, sizeof(blob));
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "NVS save autonomous cfg failed: %s", esp_err_to_name(err));
+  }
+  nvs_close(nvs);
+  return (err == ESP_OK);
+}
+
+static void log_autonomous_cfg(const char *prefix,
+                               const autonomous_ctrl_cfg_t *cfg) {
+  if (prefix == NULL || cfg == NULL) {
+    return;
+  }
+
+  ESP_LOGI(TAG,
+           "%s windows[a=%u b=%u] curtain=%u sp[rail=%u grow=%u upper=%u "
+           "undertray=%u]",
+           prefix, (unsigned)cfg->windows_pos_a_target,
+           (unsigned)cfg->windows_pos_b_target,
+           (unsigned)cfg->curtain_pos_target, (unsigned)cfg->sp_water_rail,
+           (unsigned)cfg->sp_water_grow, (unsigned)cfg->sp_water_upper,
+           (unsigned)cfg->sp_water_undertray);
+  ESP_LOGI(TAG,
+           "Autonomous light cfg R1[EN=%u ON=%04u OFF=%04u] "
+           "R2[EN=%u ON=%04u OFF=%04u] hyst_s=%u",
+           (unsigned)cfg->light.relay[0].schedule.enable,
+           (unsigned)cfg->light.relay[0].schedule.on_hhmm,
+           (unsigned)cfg->light.relay[0].schedule.off_hhmm,
+           (unsigned)cfg->light.relay[1].schedule.enable,
+           (unsigned)cfg->light.relay[1].schedule.on_hhmm,
+           (unsigned)cfg->light.relay[1].schedule.off_hhmm,
+           (unsigned)cfg->light.hyst_sec);
+}
+
+static esp_err_t update_autonomous_cfg(const autonomous_ctrl_cfg_t *cfg) {
+  if (cfg == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  autonomous_ctrl_cfg_t normalized_cfg = *cfg;
+  normalize_autonomous_cfg(&normalized_cfg);
+  if (!validate_autonomous_cfg(&normalized_cfg)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!persist_autonomous_cfg(&normalized_cfg)) {
+    return ESP_FAIL;
+  }
+
+  taskENTER_CRITICAL(&s_state_lock);
+  s_autonomous_cfg = normalized_cfg;
+  s_last_logged_schedule_mask = UINT8_MAX;
+  s_last_logged_schedule_mode = UINT8_MAX;
+  s_last_logged_light_output_percent = UINT16_MAX;
+  s_last_logged_light_status_bits = UINT16_MAX;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  log_autonomous_cfg("Autonomous cfg updated", &normalized_cfg);
+  return ESP_OK;
+}
+
 static void load_persisted_settings(void) {
   nvs_handle_t nvs = 0;
   esp_err_t err = nvs_open(MODBUS_NVS_NAMESPACE, NVS_READWRITE, &nvs);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "NVS open failed, using defaults: %s", esp_err_to_name(err));
     s_slave_id = MODBUS_DEFAULT_SLAVE_ID;
-    s_remote_active_cfg = s_autonomous_cfg;
-    s_remote_active_cfg.ctrl_version = 1;
+    s_remote_active_cfg = s_remote_cfg_default;
     set_default_light_state();
+    set_default_autonomous_cfg();
     return;
   }
 
@@ -687,8 +915,7 @@ static void load_persisted_settings(void) {
       validate_remote_cfg(&blob.cfg)) {
     s_remote_active_cfg = blob.cfg;
   } else {
-    s_remote_active_cfg = s_autonomous_cfg;
-    s_remote_active_cfg.ctrl_version = 1;
+    s_remote_active_cfg = s_remote_cfg_default;
     need_persist_default_remote = true;
   }
 
@@ -716,6 +943,27 @@ static void load_persisted_settings(void) {
     need_persist_default_light = true;
   }
 
+  bool need_persist_default_autonomous = false;
+  persisted_autonomous_cfg_t autonomous_blob = {0};
+  size_t autonomous_blob_size = sizeof(autonomous_blob);
+  err = nvs_get_blob(nvs, MODBUS_NVS_KEY_AUTONOMOUS_CFG, &autonomous_blob,
+                     &autonomous_blob_size);
+  if (err == ESP_OK && autonomous_blob_size == sizeof(autonomous_blob) &&
+      autonomous_blob.magic == MODBUS_AUTONOMOUS_CFG_MAGIC &&
+      validate_autonomous_cfg(&autonomous_blob.cfg)) {
+    uint32_t expected_crc = compute_autonomous_cfg_crc32(&autonomous_blob.cfg);
+    if (expected_crc == autonomous_blob.crc32) {
+      s_autonomous_cfg = autonomous_blob.cfg;
+      normalize_autonomous_cfg(&s_autonomous_cfg);
+    } else {
+      set_default_autonomous_cfg();
+      need_persist_default_autonomous = true;
+    }
+  } else {
+    set_default_autonomous_cfg();
+    need_persist_default_autonomous = true;
+  }
+
   nvs_close(nvs);
 
   if (need_persist_default_remote) {
@@ -724,6 +972,11 @@ static void load_persisted_settings(void) {
   if (need_persist_default_light) {
     (void)persist_light_state(&s_active_light_cfg, s_active_ctrl_version);
   }
+  if (need_persist_default_autonomous) {
+    (void)persist_autonomous_cfg(&s_autonomous_cfg);
+  }
+
+  log_autonomous_cfg("Autonomous cfg loaded", &s_autonomous_cfg);
 }
 
 static bool is_period_active(const light_period_cfg_t *slot, uint16_t now_minute_of_day) {
@@ -1734,18 +1987,12 @@ static void modbus_runtime_task(void *arg) {
     }
     taskEXIT_CRITICAL(&s_state_lock);
 
-    if (entered_autonomous) {
-      // Safety action on mode switch: force both windows to fully closed (0%).
-      ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-      s_holding_regs[MODBUS_HREG_WINDOWS_POS_A_TARGET] = 0;
-      s_holding_regs[MODBUS_HREG_WINDOWS_POS_B_TARGET] = 0;
-      ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
-      ESP_LOGW(TAG,
-               "Mode changed: REMOTE -> AUTONOMOUS (master timeout > %u ms), "
-               "forced windows targets A/B to 0%%",
-               (unsigned)MODBUS_HEARTBEAT_TIMEOUT_MS);
-      modbus_get_light_relay_state(NULL, NULL);
-    }
+	    if (entered_autonomous) {
+	      ESP_LOGW(TAG,
+	               "Mode changed: REMOTE -> AUTONOMOUS (master timeout > %u ms)",
+	               (unsigned)MODBUS_HEARTBEAT_TIMEOUT_MS);
+	      modbus_get_light_relay_state(NULL, NULL);
+	    }
 
     ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
     update_diag_regs_locked();
@@ -1952,8 +2199,11 @@ void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on) {
   active_light_cfg = s_active_light_cfg;
   effective_light_cfg = active_light_cfg;
   if (mode == MODBUS_MODE_AUTONOMOUS) {
-    effective_light_cfg.relay[0].schedule = s_autonomous_cfg.periods[0];
-    effective_light_cfg.relay[1].schedule = s_autonomous_cfg.periods[0];
+    effective_light_cfg = s_autonomous_cfg.light;
+    for (int i = 0; i < MODBUS_LIGHT_RELAY_COUNT; ++i) {
+      effective_light_cfg.relay[i].threshold_wm2 = 0U;
+      effective_light_cfg.relay[i].dli_off_limit_jcm2 = 0U;
+    }
   }
   light_hour = s_light_hour;
   light_minute = s_light_minute;
@@ -2031,7 +2281,7 @@ void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on) {
       if (dli_limit_active) {
         next_pending_since_ms[i] = 0U;
       } else if (raw_target_valid) {
-        if (active_light_cfg.hyst_sec == 0U) {
+        if (effective_light_cfg.hyst_sec == 0U) {
           stable_on = raw_target_on;
           next_pending_since_ms[i] = 0U;
         } else if (raw_target_on == prev_stable_on) {
@@ -2046,7 +2296,7 @@ void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on) {
           next_pending_since_ms[i] = cycle_now_ms;
           hyst_hold = true;
         } else if ((cycle_now_ms - prev_pending_since_ms[i]) <
-                   ((uint32_t)active_light_cfg.hyst_sec * 1000U)) {
+                   ((uint32_t)effective_light_cfg.hyst_sec * 1000U)) {
           stable_on = prev_stable_on;
           next_pending_valid_mask |= relay_bit;
           if (prev_pending_target_on) {
@@ -2149,9 +2399,1101 @@ void modbus_set_solar_radiation(float radiation) {
   ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
 }
 
+#define MODBUS_ASCII_MAX_TOKENS 16
+#define MODBUS_ASCII_LINE_MAX 160
+
+static void trim_ascii_whitespace(char *text) {
+  if (text == NULL) {
+    return;
+  }
+
+  size_t start = 0U;
+  size_t len = strlen(text);
+  while (text[start] != '\0' && isspace((unsigned char)text[start])) {
+    start++;
+  }
+  while (len > start && isspace((unsigned char)text[len - 1U])) {
+    len--;
+  }
+  if (start > 0U) {
+    memmove(text, &text[start], len - start);
+  }
+  text[len - start] = '\0';
+}
+
+static size_t tokenize_ascii_command(char *text, char *tokens[],
+                                     size_t max_tokens) {
+  size_t count = 0U;
+  char *saveptr = NULL;
+  char *token = strtok_r(text, " \t", &saveptr);
+  while (token != NULL) {
+    if (count >= max_tokens) {
+      return max_tokens + 1U;
+    }
+    for (char *p = token; *p != '\0'; ++p) {
+      *p = (char)tolower((unsigned char)*p);
+    }
+    tokens[count++] = token;
+    token = strtok_r(NULL, " \t", &saveptr);
+  }
+  return count;
+}
+
+static bool parse_u16_ascii(const char *text, uint16_t max_value,
+                            uint16_t *out_value) {
+  if (text == NULL || out_value == NULL) {
+    return false;
+  }
+
+  char *end = NULL;
+  unsigned long value = strtoul(text, &end, 10);
+  if (text == end || end == NULL || *end != '\0' || value > max_value) {
+    return false;
+  }
+
+  *out_value = (uint16_t)value;
+  return true;
+}
+
+static bool parse_tenths_ascii(const char *text, float min_value,
+                               float max_value, uint16_t *out_tenths) {
+  if (text == NULL || out_tenths == NULL) {
+    return false;
+  }
+
+  char *end = NULL;
+  double value = strtod(text, &end);
+  if (text == end || end == NULL || *end != '\0' || value < (double)min_value ||
+      value > (double)max_value) {
+    return false;
+  }
+
+  *out_tenths = (uint16_t)(value * 10.0 + 0.5);
+  return true;
+}
+
+static bool parse_signed_tenths_ascii(const char *text, float min_value,
+                                      float max_value, int16_t *out_tenths) {
+  if (text == NULL || out_tenths == NULL) {
+    return false;
+  }
+
+  char *end = NULL;
+  double value = strtod(text, &end);
+  if (text == end || end == NULL || *end != '\0' || value < (double)min_value ||
+      value > (double)max_value) {
+    return false;
+  }
+
+  double scaled = value * 10.0;
+  int32_t tenths =
+      (scaled >= 0.0) ? (int32_t)(scaled + 0.5) : (int32_t)(scaled - 0.5);
+  if (tenths < (int32_t)INT16_MIN || tenths > (int32_t)INT16_MAX) {
+    return false;
+  }
+
+  *out_tenths = (int16_t)tenths;
+  return true;
+}
+
+static bool parse_switch_ascii(const char *text, uint16_t *out_value) {
+  if (text == NULL || out_value == NULL) {
+    return false;
+  }
+
+  if (strcmp(text, "1") == 0 || strcmp(text, "on") == 0 ||
+      strcmp(text, "true") == 0 || strcmp(text, "enable") == 0) {
+    *out_value = 1U;
+    return true;
+  }
+  if (strcmp(text, "0") == 0 || strcmp(text, "off") == 0 ||
+      strcmp(text, "false") == 0 || strcmp(text, "disable") == 0) {
+    *out_value = 0U;
+    return true;
+  }
+  return false;
+}
+
+static bool parse_hhmm_ascii(const char *text, uint16_t *out_hhmm) {
+  if (text == NULL || out_hhmm == NULL) {
+    return false;
+  }
+
+  char digits[5] = {0};
+  size_t len = strlen(text);
+  if (len == 5U && text[2] == ':') {
+    if (!isdigit((unsigned char)text[0]) || !isdigit((unsigned char)text[1]) ||
+        !isdigit((unsigned char)text[3]) || !isdigit((unsigned char)text[4])) {
+      return false;
+    }
+    digits[0] = text[0];
+    digits[1] = text[1];
+    digits[2] = text[3];
+    digits[3] = text[4];
+  } else if (len == 4U) {
+    for (size_t i = 0; i < len; ++i) {
+      if (!isdigit((unsigned char)text[i])) {
+        return false;
+      }
+      digits[i] = text[i];
+    }
+  } else {
+    return false;
+  }
+
+  uint16_t hh = (uint16_t)(((uint16_t)(digits[0] - '0') * 10U) +
+                           (uint16_t)(digits[1] - '0'));
+  uint16_t mm = (uint16_t)(((uint16_t)(digits[2] - '0') * 10U) +
+                           (uint16_t)(digits[3] - '0'));
+  if (hh > 23U || mm > 59U) {
+    return false;
+  }
+
+  *out_hhmm = (uint16_t)(hh * 100U + mm);
+  return true;
+}
+
+static bool parse_light_relay_ascii(const char *text, size_t *relay_index) {
+  if (text == NULL || relay_index == NULL) {
+    return false;
+  }
+
+  if (strcmp(text, "r1") == 0 || strcmp(text, "relay1") == 0 ||
+      strcmp(text, "1") == 0) {
+    *relay_index = 0U;
+    return true;
+  }
+  if (strcmp(text, "r2") == 0 || strcmp(text, "relay2") == 0 ||
+      strcmp(text, "2") == 0) {
+    *relay_index = 1U;
+    return true;
+  }
+  return false;
+}
+
+static void format_hhmm_ascii(uint16_t hhmm, char *buffer, size_t buffer_len) {
+  if (buffer == NULL || buffer_len == 0U) {
+    return;
+  }
+
+  uint16_t hh = (uint16_t)(hhmm / 100U);
+  uint16_t mm = (uint16_t)(hhmm % 100U);
+  snprintf(buffer, buffer_len, "%02u:%02u", (unsigned)hh, (unsigned)mm);
+}
+
+static const char *mode_to_string(modbus_mode_state_t mode) {
+  return (mode == MODBUS_MODE_AUTONOMOUS) ? "AUTONOMOUS" : "REMOTE";
+}
+
+static const char *reason_to_string(modbus_mode_reason_t reason) {
+  switch (reason) {
+  case MODBUS_REASON_MASTER_TIMEOUT:
+    return "MASTER_TIMEOUT";
+  case MODBUS_REASON_NONE:
+  default:
+    return "NONE";
+  }
+}
+
+static const char *weather_result_to_string(modbus_weather_set_result_t result) {
+  switch (result) {
+  case MODBUS_WEATHER_SET_RESULT_APPLIED:
+    return "APPLIED";
+  case MODBUS_WEATHER_SET_RESULT_NOOP:
+    return "NOOP";
+  case MODBUS_WEATHER_SET_RESULT_FAILED:
+    return "FAILED";
+  case MODBUS_WEATHER_SET_RESULT_NONE:
+  default:
+    return "NONE";
+  }
+}
+
+static void snapshot_autonomous_state(autonomous_ctrl_cfg_t *cfg,
+                                      modbus_mode_state_t *mode,
+                                      modbus_mode_reason_t *reason) {
+  if (cfg == NULL || mode == NULL || reason == NULL) {
+    return;
+  }
+
+  taskENTER_CRITICAL(&s_state_lock);
+  *cfg = s_autonomous_cfg;
+  *mode = s_mode_state;
+  *reason = s_mode_reason;
+  taskEXIT_CRITICAL(&s_state_lock);
+}
+
+static void snapshot_weather_ascii_state(weather_snapshot_t *snapshot,
+                                         uint16_t *set_token,
+                                         uint16_t *applied_token,
+                                         modbus_weather_set_result_t *result,
+                                         bool *valid, bool *stale) {
+  taskENTER_CRITICAL(&s_state_lock);
+  if (snapshot != NULL) {
+    *snapshot = s_weather_active_snapshot;
+  }
+  if (valid != NULL) {
+    *valid = s_weather_valid;
+  }
+  if (stale != NULL) {
+    *stale = s_weather_stale;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  uint16_t local_set_token = 0U;
+  uint16_t local_applied_token = 0U;
+  modbus_weather_set_result_t local_result = MODBUS_WEATHER_SET_RESULT_NONE;
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    local_set_token = s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN];
+    local_applied_token = s_holding_regs[MODBUS_HREG_WEATHER_SET_APPLIED_TOKEN];
+    local_result =
+        (modbus_weather_set_result_t)s_holding_regs[MODBUS_HREG_WEATHER_SET_RESULT];
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  } else {
+    taskENTER_CRITICAL(&s_state_lock);
+    local_set_token =
+        (s_weather_pending_token != 0U) ? s_weather_pending_token : s_weather_last_token;
+    local_applied_token = s_weather_last_token;
+    local_result =
+        s_weather_valid ? MODBUS_WEATHER_SET_RESULT_APPLIED
+                        : MODBUS_WEATHER_SET_RESULT_NONE;
+    taskEXIT_CRITICAL(&s_state_lock);
+  }
+
+  if (set_token != NULL) {
+    *set_token = local_set_token;
+  }
+  if (applied_token != NULL) {
+    *applied_token = local_applied_token;
+  }
+  if (result != NULL) {
+    *result = local_result;
+  }
+}
+
+static uint16_t allocate_weather_ascii_token(void) {
+  uint16_t token = 0U;
+
+  taskENTER_CRITICAL(&s_state_lock);
+  token = s_weather_last_token;
+  if (s_weather_pending_token > token) {
+    token = s_weather_pending_token;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    if (s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN] > token) {
+      token = s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN];
+    }
+    if (s_holding_regs[MODBUS_HREG_WEATHER_SET_APPLIED_TOKEN] > token) {
+      token = s_holding_regs[MODBUS_HREG_WEATHER_SET_APPLIED_TOKEN];
+    }
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  }
+
+  token = (uint16_t)(token + 1U);
+  if (token == 0U) {
+    token = 1U;
+  }
+  return token;
+}
+
+static esp_err_t write_weather_snapshot_to_regs(const weather_snapshot_t *snapshot,
+                                                uint16_t token) {
+  if (snapshot == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (s_mbc_slave_handler == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  s_holding_regs[MODBUS_HREG_WEATHER_OUT_TEMP] = (uint16_t)snapshot->out_temp;
+  s_holding_regs[MODBUS_HREG_WEATHER_OUT_HUM] = snapshot->out_hum;
+  s_holding_regs[MODBUS_HREG_WEATHER_WIND_SPEED] = snapshot->wind_speed;
+  s_holding_regs[MODBUS_HREG_WEATHER_WIND_DIR] = snapshot->wind_dir;
+  s_holding_regs[MODBUS_HREG_WEATHER_RAIN_FLAG] = snapshot->rain_flag;
+  s_holding_regs[MODBUS_HREG_WEATHER_SOLAR_RAD] = snapshot->solar_rad;
+  s_holding_regs[MODBUS_HREG_WEATHER_BARO_PRESS] = snapshot->baro_press;
+  s_holding_regs[MODBUS_HREG_WEATHER_DEW_POINT] = (uint16_t)snapshot->dew_point;
+  s_holding_regs[MODBUS_HREG_WEATHER_STATUS_BITS] = snapshot->status_bits;
+  s_holding_regs[MODBUS_HREG_WEATHER_AGE_S] = snapshot->source_age_s;
+  s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN] = token;
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  return ESP_OK;
+}
+
+static void format_autonomous_summary(char *response, size_t response_len) {
+  if (response == NULL || response_len == 0U) {
+    return;
+  }
+
+  autonomous_ctrl_cfg_t cfg = {0};
+  modbus_mode_state_t mode = MODBUS_MODE_REMOTE;
+  modbus_mode_reason_t reason = MODBUS_REASON_NONE;
+  snapshot_autonomous_state(&cfg, &mode, &reason);
+
+  char r1_on[6] = {0};
+  char r1_off[6] = {0};
+  char r2_on[6] = {0};
+  char r2_off[6] = {0};
+  format_hhmm_ascii(cfg.light.relay[0].schedule.on_hhmm, r1_on, sizeof(r1_on));
+  format_hhmm_ascii(cfg.light.relay[0].schedule.off_hhmm, r1_off,
+                    sizeof(r1_off));
+  format_hhmm_ascii(cfg.light.relay[1].schedule.on_hhmm, r2_on, sizeof(r2_on));
+  format_hhmm_ascii(cfg.light.relay[1].schedule.off_hhmm, r2_off,
+                    sizeof(r2_off));
+
+  snprintf(
+      response, response_len,
+      "OK mode=%s reason=%s windows[a=%.1f%% b=%.1f%%] curtain=%.1f%% "
+      "sp[rail=%.1fC grow=%.1fC upper=%.1fC undertray=%.1fC] "
+      "light[r1 en=%u on=%s off=%s, r2 en=%u on=%s off=%s, hyst=%u]",
+      mode_to_string(mode), reason_to_string(reason),
+      ((float)cfg.windows_pos_a_target) / 10.0f,
+      ((float)cfg.windows_pos_b_target) / 10.0f,
+      ((float)cfg.curtain_pos_target) / 10.0f,
+      ((float)cfg.sp_water_rail) / 10.0f, ((float)cfg.sp_water_grow) / 10.0f,
+      ((float)cfg.sp_water_upper) / 10.0f,
+      ((float)cfg.sp_water_undertray) / 10.0f,
+      (unsigned)cfg.light.relay[0].schedule.enable, r1_on, r1_off,
+      (unsigned)cfg.light.relay[1].schedule.enable, r2_on, r2_off,
+      (unsigned)cfg.light.hyst_sec);
+}
+
+static void format_weather_summary(char *response, size_t response_len) {
+  if (response == NULL || response_len == 0U) {
+    return;
+  }
+
+  weather_snapshot_t snapshot = {0};
+  uint16_t set_token = 0U;
+  uint16_t applied_token = 0U;
+  modbus_weather_set_result_t result = MODBUS_WEATHER_SET_RESULT_NONE;
+  bool valid = false;
+  bool stale = true;
+  snapshot_weather_ascii_state(&snapshot, &set_token, &applied_token, &result,
+                               &valid, &stale);
+
+  snprintf(response, response_len,
+           "OK weather valid=%u stale=%u token=%u applied=%u result=%s "
+           "out=%.1fC hum=%.1f%% wind=%.1fm/s dir=%u rain=%u solar=%uW/m2 "
+           "baro=%.1fhPa dew=%.1fC status=0x%04X age=%us",
+           valid ? 1U : 0U, stale ? 1U : 0U, (unsigned)set_token,
+           (unsigned)applied_token, weather_result_to_string(result),
+           ((float)snapshot.out_temp) / 10.0f, ((float)snapshot.out_hum) / 10.0f,
+           ((float)snapshot.wind_speed) / 10.0f, (unsigned)snapshot.wind_dir,
+           (unsigned)snapshot.rain_flag, (unsigned)snapshot.solar_rad,
+           ((float)snapshot.baro_press) / 10.0f,
+           ((float)snapshot.dew_point) / 10.0f, (unsigned)snapshot.status_bits,
+           (unsigned)snapshot.source_age_s);
+}
+
+static esp_err_t apply_ascii_weather_update(const weather_snapshot_t *snapshot,
+                                            char *response, size_t response_len,
+                                            const char *success_text) {
+  if (snapshot == NULL || response == NULL || response_len == 0U ||
+      success_text == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  const uint16_t token = allocate_weather_ascii_token();
+  modbus_weather_set_result_t result = MODBUS_WEATHER_SET_RESULT_NONE;
+
+  if (s_mbc_slave_handler != NULL) {
+    esp_err_t err = write_weather_snapshot_to_regs(snapshot, token);
+    if (err != ESP_OK) {
+      snprintf(response, response_len, "ERR failed to stage weather snapshot");
+      return err;
+    }
+
+    queue_weather_sync_request_from_regs();
+    process_pending_weather_sync();
+
+    uint16_t applied_token = 0U;
+    snapshot_weather_ascii_state(NULL, NULL, &applied_token, &result, NULL, NULL);
+    if (applied_token != token ||
+        (result != MODBUS_WEATHER_SET_RESULT_APPLIED &&
+         result != MODBUS_WEATHER_SET_RESULT_NOOP)) {
+      snprintf(response, response_len, "ERR failed to apply weather snapshot");
+      return ESP_FAIL;
+    }
+  } else {
+    const uint32_t now = now_ms();
+    taskENTER_CRITICAL(&s_state_lock);
+    s_weather_active_snapshot = *snapshot;
+    s_weather_last_token = token;
+    s_weather_pending_token = 0U;
+    s_weather_sync_pending = false;
+    s_weather_valid = true;
+    s_weather_stale = false;
+    s_weather_last_rx_ms = now;
+    taskEXIT_CRITICAL(&s_state_lock);
+    result = MODBUS_WEATHER_SET_RESULT_APPLIED;
+  }
+
+  snprintf(response, response_len, "OK %s token=%u result=%s", success_text,
+           (unsigned)token, weather_result_to_string(result));
+  return ESP_OK;
+}
+
+static esp_err_t handle_ascii_weather_short_alias_command(size_t token_count,
+                                                          char *tokens[],
+                                                          char *response,
+                                                          size_t response_len) {
+  if (token_count != 2U || tokens == NULL || response == NULL ||
+      response_len == 0U) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  const char *name = tokens[0];
+  const char *value = tokens[1];
+  weather_snapshot_t snapshot = {0};
+  snapshot_weather_ascii_state(&snapshot, NULL, NULL, NULL, NULL, NULL);
+
+  if (strcmp(name, "wx_temp") == 0) {
+    int16_t temp_tenths = 0;
+    if (!parse_signed_tenths_ascii(value, -60.0f, 80.0f, &temp_tenths)) {
+      snprintf(response, response_len, "ERR invalid outside temperature");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.out_temp = temp_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_temp=%.1fC",
+             ((float)temp_tenths) / 10.0f);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_hum") == 0) {
+    uint16_t hum_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 100.0f, &hum_tenths)) {
+      snprintf(response, response_len, "ERR invalid outside humidity");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.out_hum = hum_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_hum=%.1f%%",
+             ((float)hum_tenths) / 10.0f);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_wind") == 0) {
+    uint16_t wind_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 100.0f, &wind_tenths)) {
+      snprintf(response, response_len, "ERR invalid wind speed");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.wind_speed = wind_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_wind=%.1fm/s",
+             ((float)wind_tenths) / 10.0f);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_dir") == 0) {
+    uint16_t wind_dir = 0U;
+    if (!parse_u16_ascii(value, 359U, &wind_dir)) {
+      snprintf(response, response_len, "ERR invalid wind direction");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.wind_dir = wind_dir;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_dir=%u", (unsigned)wind_dir);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_rain") == 0) {
+    uint16_t rain_flag = 0U;
+    if (!parse_switch_ascii(value, &rain_flag)) {
+      snprintf(response, response_len, "ERR invalid rain flag");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.rain_flag = rain_flag;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_rain=%u", (unsigned)rain_flag);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_solar") == 0) {
+    uint16_t solar_rad = 0U;
+    if (!parse_u16_ascii(value, UINT16_MAX, &solar_rad)) {
+      snprintf(response, response_len, "ERR invalid solar radiation");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.solar_rad = solar_rad;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_solar=%uW/m2",
+             (unsigned)solar_rad);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_baro") == 0) {
+    uint16_t baro_tenths = 0U;
+    if (!parse_tenths_ascii(value, 300.0f, 1200.0f, &baro_tenths)) {
+      snprintf(response, response_len, "ERR invalid barometric pressure");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.baro_press = baro_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_baro=%.1fhPa",
+             ((float)baro_tenths) / 10.0f);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_dew") == 0) {
+    int16_t dew_tenths = 0;
+    if (!parse_signed_tenths_ascii(value, -80.0f, 80.0f, &dew_tenths)) {
+      snprintf(response, response_len, "ERR invalid dew point");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.dew_point = dew_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_dew=%.1fC",
+             ((float)dew_tenths) / 10.0f);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_age") == 0) {
+    uint16_t age_s = 0U;
+    if (!parse_u16_ascii(value, UINT16_MAX, &age_s)) {
+      snprintf(response, response_len, "ERR invalid weather age");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.source_age_s = age_s;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_age=%us", (unsigned)age_s);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "wx_stat") == 0) {
+    uint16_t status_bits = 0U;
+    if (!parse_u16_ascii(value, UINT16_MAX, &status_bits)) {
+      snprintf(response, response_len, "ERR invalid weather status bits");
+      return ESP_ERR_INVALID_ARG;
+    }
+    snapshot.status_bits = status_bits;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "wx_stat=0x%04X",
+             (unsigned)status_bits);
+    return apply_ascii_weather_update(&snapshot, response, response_len, ok_text);
+  }
+
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
+static esp_err_t handle_ascii_short_alias_command(size_t token_count,
+                                                  char *tokens[],
+                                                  char *response,
+                                                  size_t response_len) {
+  if (token_count != 2U || tokens == NULL || response == NULL ||
+      response_len == 0U) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  esp_err_t weather_result = handle_ascii_weather_short_alias_command(
+      token_count, tokens, response, response_len);
+  if (weather_result != ESP_ERR_NOT_SUPPORTED) {
+    return weather_result;
+  }
+
+  autonomous_ctrl_cfg_t cfg = {0};
+  modbus_mode_state_t mode_snapshot = MODBUS_MODE_REMOTE;
+  modbus_mode_reason_t reason_snapshot = MODBUS_REASON_NONE;
+  snapshot_autonomous_state(&cfg, &mode_snapshot, &reason_snapshot);
+  (void)mode_snapshot;
+  (void)reason_snapshot;
+
+  const char *name = tokens[0];
+  const char *value = tokens[1];
+
+  if (strcmp(name, "win_a_pos") == 0) {
+    uint16_t percent_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 100.0f, &percent_tenths)) {
+      snprintf(response, response_len, "ERR invalid percent value");
+      return ESP_ERR_INVALID_ARG;
+    }
+    cfg.windows_pos_a_target = percent_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "win_a_pos=%.1f%%",
+             ((float)percent_tenths) / 10.0f);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "win_b_pos") == 0) {
+    uint16_t percent_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 100.0f, &percent_tenths)) {
+      snprintf(response, response_len, "ERR invalid percent value");
+      return ESP_ERR_INVALID_ARG;
+    }
+    cfg.windows_pos_b_target = percent_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "win_b_pos=%.1f%%",
+             ((float)percent_tenths) / 10.0f);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "curt_pos") == 0) {
+    uint16_t percent_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 100.0f, &percent_tenths)) {
+      snprintf(response, response_len, "ERR invalid percent value");
+      return ESP_ERR_INVALID_ARG;
+    }
+    cfg.curtain_pos_target = percent_tenths;
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "curt_pos=%.1f%%",
+             ((float)percent_tenths) / 10.0f);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "sp_rail") == 0 || strcmp(name, "sp_grow") == 0 ||
+      strcmp(name, "sp_upper") == 0 || strcmp(name, "sp_under") == 0) {
+    uint16_t temp_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 120.0f, &temp_tenths)) {
+      snprintf(response, response_len, "ERR invalid temperature value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(name, "sp_rail") == 0) {
+      cfg.sp_water_rail = temp_tenths;
+    } else if (strcmp(name, "sp_grow") == 0) {
+      cfg.sp_water_grow = temp_tenths;
+    } else if (strcmp(name, "sp_upper") == 0) {
+      cfg.sp_water_upper = temp_tenths;
+    } else {
+      cfg.sp_water_undertray = temp_tenths;
+    }
+
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "%s=%.1fC", name,
+             ((float)temp_tenths) / 10.0f);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "l1_on") == 0 || strcmp(name, "l1_off") == 0 ||
+      strcmp(name, "l2_on") == 0 || strcmp(name, "l2_off") == 0) {
+    uint16_t hhmm = 0U;
+    if (!parse_hhmm_ascii(value, &hhmm)) {
+      snprintf(response, response_len, "ERR invalid HH:MM value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t relay_index = (name[1] == '1') ? 0U : 1U;
+    if (strstr(name, "_on") != NULL) {
+      cfg.light.relay[relay_index].schedule.on_hhmm = hhmm;
+    } else {
+      cfg.light.relay[relay_index].schedule.off_hhmm = hhmm;
+    }
+
+    char hhmm_text[6] = {0};
+    char ok_text[48] = {0};
+    format_hhmm_ascii(hhmm, hhmm_text, sizeof(hhmm_text));
+    snprintf(ok_text, sizeof(ok_text), "%s=%s", name, hhmm_text);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "l1_thr") == 0 || strcmp(name, "l2_thr") == 0 ||
+      strcmp(name, "l1_dli") == 0 || strcmp(name, "l2_dli") == 0) {
+    snprintf(response, response_len,
+             "ERR setpoint not used in autonomous mode");
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  if (strcmp(name, "light_hyst") == 0) {
+    uint16_t raw_value = 0U;
+    if (!parse_u16_ascii(value, UINT16_MAX, &raw_value)) {
+      snprintf(response, response_len, "ERR invalid integer value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    cfg.light.hyst_sec = raw_value;
+
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "%s=%u", name, (unsigned)raw_value);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (strcmp(name, "l1_en") == 0 || strcmp(name, "l2_en") == 0) {
+    uint16_t enable_value = 0U;
+    if (!parse_switch_ascii(value, &enable_value)) {
+      snprintf(response, response_len, "ERR invalid enable value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t relay_index = (name[1] == '1') ? 0U : 1U;
+    cfg.light.relay[relay_index].schedule.enable = enable_value;
+
+    char ok_text[48] = {0};
+    snprintf(ok_text, sizeof(ok_text), "%s=%u", name, (unsigned)enable_value);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
+static esp_err_t apply_ascii_autonomous_update(const autonomous_ctrl_cfg_t *cfg,
+                                               char *response,
+                                               size_t response_len,
+                                               const char *success_text) {
+  esp_err_t err = update_autonomous_cfg(cfg);
+  if (err == ESP_OK) {
+    snprintf(response, response_len, "OK %s", success_text);
+  } else if (err == ESP_ERR_INVALID_ARG) {
+    snprintf(response, response_len, "ERR value out of range");
+  } else {
+    snprintf(response, response_len, "ERR failed to save autonomous config");
+  }
+  return err;
+}
+
+static esp_err_t handle_ascii_show_command(size_t token_count, char *tokens[],
+                                           char *response,
+                                           size_t response_len) {
+  if (response == NULL || response_len == 0U) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (token_count == 0U ||
+      (token_count == 1U && strcmp(tokens[0], "autonomous") == 0)) {
+    format_autonomous_summary(response, response_len);
+    return ESP_OK;
+  }
+
+  if (token_count == 1U && strcmp(tokens[0], "mode") == 0) {
+    modbus_mode_state_t mode = MODBUS_MODE_REMOTE;
+    modbus_mode_reason_t reason = MODBUS_REASON_NONE;
+    autonomous_ctrl_cfg_t cfg = {0};
+    snapshot_autonomous_state(&cfg, &mode, &reason);
+    (void)cfg;
+    snprintf(response, response_len, "OK mode=%s reason=%s",
+             mode_to_string(mode), reason_to_string(reason));
+    return ESP_OK;
+  }
+
+  if (token_count == 1U && strcmp(tokens[0], "weather") == 0) {
+    format_weather_summary(response, response_len);
+    return ESP_OK;
+  }
+
+  if (token_count == 2U && strcmp(tokens[0], "light") == 0) {
+    size_t relay_index = 0U;
+    if (!parse_light_relay_ascii(tokens[1], &relay_index)) {
+      snprintf(response, response_len, "ERR unknown relay");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    autonomous_ctrl_cfg_t cfg = {0};
+    modbus_mode_state_t mode = MODBUS_MODE_REMOTE;
+    modbus_mode_reason_t reason = MODBUS_REASON_NONE;
+    snapshot_autonomous_state(&cfg, &mode, &reason);
+
+    char on_hhmm[6] = {0};
+    char off_hhmm[6] = {0};
+    format_hhmm_ascii(cfg.light.relay[relay_index].schedule.on_hhmm, on_hhmm,
+                      sizeof(on_hhmm));
+    format_hhmm_ascii(cfg.light.relay[relay_index].schedule.off_hhmm,
+                      off_hhmm, sizeof(off_hhmm));
+    snprintf(response, response_len,
+             "OK light %s en=%u on=%s off=%s hyst=%u mode=%s",
+             (relay_index == 0U) ? "r1" : "r2",
+             (unsigned)cfg.light.relay[relay_index].schedule.enable, on_hhmm,
+             off_hhmm, (unsigned)cfg.light.hyst_sec, mode_to_string(mode));
+    return ESP_OK;
+  }
+
+  snprintf(response, response_len, "ERR unsupported show command");
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
+static esp_err_t handle_ascii_set_command(size_t token_count, char *tokens[],
+                                          char *response,
+                                          size_t response_len) {
+  if (token_count == 0U || response == NULL || response_len == 0U) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t short_alias_result =
+      handle_ascii_short_alias_command(token_count, tokens, response,
+                                       response_len);
+  if (short_alias_result != ESP_ERR_NOT_SUPPORTED) {
+    return short_alias_result;
+  }
+
+  if (token_count == 3U && strcmp(tokens[0], "weather") == 0) {
+    const char *alias_name = NULL;
+    if (strcmp(tokens[1], "temp") == 0 || strcmp(tokens[1], "out_temp") == 0) {
+      alias_name = "wx_temp";
+    } else if (strcmp(tokens[1], "hum") == 0 ||
+               strcmp(tokens[1], "out_hum") == 0) {
+      alias_name = "wx_hum";
+    } else if (strcmp(tokens[1], "wind") == 0 ||
+               strcmp(tokens[1], "wind_speed") == 0) {
+      alias_name = "wx_wind";
+    } else if (strcmp(tokens[1], "dir") == 0 ||
+               strcmp(tokens[1], "wind_dir") == 0) {
+      alias_name = "wx_dir";
+    } else if (strcmp(tokens[1], "rain") == 0) {
+      alias_name = "wx_rain";
+    } else if (strcmp(tokens[1], "solar") == 0) {
+      alias_name = "wx_solar";
+    } else if (strcmp(tokens[1], "baro") == 0 ||
+               strcmp(tokens[1], "baro_press") == 0) {
+      alias_name = "wx_baro";
+    } else if (strcmp(tokens[1], "dew") == 0 ||
+               strcmp(tokens[1], "dew_point") == 0) {
+      alias_name = "wx_dew";
+    } else if (strcmp(tokens[1], "age") == 0) {
+      alias_name = "wx_age";
+    } else if (strcmp(tokens[1], "status") == 0 ||
+               strcmp(tokens[1], "status_bits") == 0) {
+      alias_name = "wx_stat";
+    }
+
+    if (alias_name != NULL) {
+      char *alias_tokens[2] = {(char *)alias_name, tokens[2]};
+      return handle_ascii_weather_short_alias_command(2U, alias_tokens, response,
+                                                      response_len);
+    }
+
+    snprintf(response, response_len, "ERR unknown weather field");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  autonomous_ctrl_cfg_t cfg = {0};
+  modbus_mode_state_t mode_snapshot = MODBUS_MODE_REMOTE;
+  modbus_mode_reason_t reason_snapshot = MODBUS_REASON_NONE;
+  snapshot_autonomous_state(&cfg, &mode_snapshot, &reason_snapshot);
+  (void)mode_snapshot;
+  (void)reason_snapshot;
+
+  if (token_count == 5U && strcmp(tokens[0], "windows") == 0 &&
+      strcmp(tokens[2], "pos") == 0 && strcmp(tokens[3], "target") == 0) {
+    uint16_t percent_tenths = 0U;
+    if (!parse_tenths_ascii(tokens[4], 0.0f, 100.0f, &percent_tenths)) {
+      snprintf(response, response_len, "ERR invalid percent value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(tokens[1], "a") == 0) {
+      cfg.windows_pos_a_target = percent_tenths;
+      char ok_text[64] = {0};
+      snprintf(ok_text, sizeof(ok_text), "windows a pos target=%.1f%%",
+               ((float)percent_tenths) / 10.0f);
+      return apply_ascii_autonomous_update(&cfg, response, response_len,
+                                           ok_text);
+    }
+    if (strcmp(tokens[1], "b") == 0) {
+      cfg.windows_pos_b_target = percent_tenths;
+      char ok_text[64] = {0};
+      snprintf(ok_text, sizeof(ok_text), "windows b pos target=%.1f%%",
+               ((float)percent_tenths) / 10.0f);
+      return apply_ascii_autonomous_update(&cfg, response, response_len,
+                                           ok_text);
+    }
+
+    snprintf(response, response_len, "ERR unknown window channel");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (token_count == 4U && strcmp(tokens[0], "curtain") == 0 &&
+      strcmp(tokens[1], "pos") == 0 && strcmp(tokens[2], "target") == 0) {
+    uint16_t percent_tenths = 0U;
+    if (!parse_tenths_ascii(tokens[3], 0.0f, 100.0f, &percent_tenths)) {
+      snprintf(response, response_len, "ERR invalid percent value");
+      return ESP_ERR_INVALID_ARG;
+    }
+    cfg.curtain_pos_target = percent_tenths;
+    char ok_text[64] = {0};
+    snprintf(ok_text, sizeof(ok_text), "curtain pos target=%.1f%%",
+             ((float)percent_tenths) / 10.0f);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (token_count == 4U && strcmp(tokens[0], "sp") == 0 &&
+      strcmp(tokens[1], "water") == 0) {
+    uint16_t temp_tenths = 0U;
+    if (!parse_tenths_ascii(tokens[3], 0.0f, 120.0f, &temp_tenths)) {
+      snprintf(response, response_len, "ERR invalid temperature value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    if (strcmp(tokens[2], "rail") == 0) {
+      cfg.sp_water_rail = temp_tenths;
+    } else if (strcmp(tokens[2], "grow") == 0) {
+      cfg.sp_water_grow = temp_tenths;
+    } else if (strcmp(tokens[2], "upper") == 0) {
+      cfg.sp_water_upper = temp_tenths;
+    } else if (strcmp(tokens[2], "undertray") == 0) {
+      cfg.sp_water_undertray = temp_tenths;
+    } else {
+      snprintf(response, response_len, "ERR unknown water setpoint");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    char ok_text[64] = {0};
+    snprintf(ok_text, sizeof(ok_text), "sp water %s=%.1fC", tokens[2],
+             ((float)temp_tenths) / 10.0f);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (token_count >= 3U && strcmp(tokens[0], "light") == 0 &&
+      strcmp(tokens[1], "hyst") == 0) {
+    const char *value_token = NULL;
+    if (token_count == 4U && strcmp(tokens[2], "sec") == 0) {
+      value_token = tokens[3];
+    } else if (token_count == 3U) {
+      value_token = tokens[2];
+    }
+
+    if (value_token == NULL) {
+      snprintf(response, response_len, "ERR expected light hyst sec <value>");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    uint16_t hyst_sec = 0U;
+    if (!parse_u16_ascii(value_token, UINT16_MAX, &hyst_sec)) {
+      snprintf(response, response_len, "ERR invalid hysteresis value");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    cfg.light.hyst_sec = hyst_sec;
+    char ok_text[64] = {0};
+    snprintf(ok_text, sizeof(ok_text), "light hyst sec=%u", (unsigned)hyst_sec);
+    return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
+  }
+
+  if (token_count >= 4U && strcmp(tokens[0], "light") == 0) {
+    size_t relay_index = 0U;
+    if (!parse_light_relay_ascii(tokens[1], &relay_index)) {
+      snprintf(response, response_len, "ERR unknown relay");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    light_relay_cfg_t *relay_cfg = &cfg.light.relay[relay_index];
+
+    if (strcmp(tokens[2], "enable") == 0 && token_count == 4U) {
+      uint16_t enable_value = 0U;
+      if (!parse_switch_ascii(tokens[3], &enable_value)) {
+        snprintf(response, response_len, "ERR invalid enable value");
+        return ESP_ERR_INVALID_ARG;
+      }
+      relay_cfg->schedule.enable = enable_value;
+      char ok_text[64] = {0};
+      snprintf(ok_text, sizeof(ok_text), "light %s enable=%u",
+               (relay_index == 0U) ? "r1" : "r2", (unsigned)enable_value);
+      return apply_ascii_autonomous_update(&cfg, response, response_len,
+                                           ok_text);
+    }
+
+    if (strcmp(tokens[2], "on") == 0 && token_count == 5U &&
+        strcmp(tokens[3], "hhmm") == 0) {
+      uint16_t hhmm = 0U;
+      if (!parse_hhmm_ascii(tokens[4], &hhmm)) {
+        snprintf(response, response_len, "ERR invalid HH:MM value");
+        return ESP_ERR_INVALID_ARG;
+      }
+      relay_cfg->schedule.on_hhmm = hhmm;
+      char hhmm_text[6] = {0};
+      char ok_text[64] = {0};
+      format_hhmm_ascii(hhmm, hhmm_text, sizeof(hhmm_text));
+      snprintf(ok_text, sizeof(ok_text), "light %s on hhmm=%s",
+               (relay_index == 0U) ? "r1" : "r2", hhmm_text);
+      return apply_ascii_autonomous_update(&cfg, response, response_len,
+                                           ok_text);
+    }
+
+    if (strcmp(tokens[2], "off") == 0 && token_count == 5U &&
+        strcmp(tokens[3], "hhmm") == 0) {
+      uint16_t hhmm = 0U;
+      if (!parse_hhmm_ascii(tokens[4], &hhmm)) {
+        snprintf(response, response_len, "ERR invalid HH:MM value");
+        return ESP_ERR_INVALID_ARG;
+      }
+      relay_cfg->schedule.off_hhmm = hhmm;
+      char hhmm_text[6] = {0};
+      char ok_text[64] = {0};
+      format_hhmm_ascii(hhmm, hhmm_text, sizeof(hhmm_text));
+      snprintf(ok_text, sizeof(ok_text), "light %s off hhmm=%s",
+               (relay_index == 0U) ? "r1" : "r2", hhmm_text);
+      return apply_ascii_autonomous_update(&cfg, response, response_len,
+                                           ok_text);
+    }
+
+    if (strcmp(tokens[2], "threshold") == 0 ||
+        strcmp(tokens[2], "dli") == 0) {
+      snprintf(response, response_len,
+               "ERR setpoint not used in autonomous mode");
+      return ESP_ERR_NOT_SUPPORTED;
+    }
+  }
+
+  snprintf(response, response_len, "ERR unsupported set command");
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t modbus_handle_ascii_command(const char *line, char *response,
+                                      size_t response_len) {
+  if (line == NULL || response == NULL || response_len == 0U) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  response[0] = '\0';
+  size_t raw_len = strlen(line);
+  if (raw_len >= MODBUS_ASCII_LINE_MAX) {
+    snprintf(response, response_len, "ERR command too long");
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  char local_line[MODBUS_ASCII_LINE_MAX] = {0};
+  memcpy(local_line, line, raw_len + 1U);
+  trim_ascii_whitespace(local_line);
+  if (local_line[0] == '\0') {
+    snprintf(response, response_len, "ERR empty command");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  char *tokens[MODBUS_ASCII_MAX_TOKENS] = {0};
+  size_t token_count =
+      tokenize_ascii_command(local_line, tokens, MODBUS_ASCII_MAX_TOKENS);
+  if (token_count == 0U) {
+    snprintf(response, response_len, "ERR empty command");
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (token_count > MODBUS_ASCII_MAX_TOKENS) {
+    snprintf(response, response_len, "ERR too many tokens");
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  if (strcmp(tokens[0], "help") == 0 || strcmp(tokens[0], "?") == 0) {
+    snprintf(response, response_len,
+             "OK show: autonomous mode light weather; set: win_a_pos win_b_pos "
+             "curt_pos sp_rail sp_grow sp_upper sp_under l1_en l1_on l1_off "
+             "l2_en l2_on l2_off light_hyst wx_temp wx_hum wx_wind wx_dir "
+             "wx_rain wx_solar wx_baro wx_dew wx_age wx_stat");
+    return ESP_OK;
+  }
+
+  if (strcmp(tokens[0], "show") == 0 || strcmp(tokens[0], "get") == 0) {
+    return handle_ascii_show_command(token_count - 1U, &tokens[1], response,
+                                     response_len);
+  }
+
+  if (strcmp(tokens[0], "set") == 0) {
+    return handle_ascii_set_command(token_count - 1U, &tokens[1], response,
+                                    response_len);
+  }
+
+  return handle_ascii_set_command(token_count, tokens, response, response_len);
+}
+
 float modbus_get_window_a_target_percent(void) {
   if (modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS) {
-    return ((float)s_autonomous_cfg.windows_pos_a_target) / 10.0f;
+    uint16_t raw_target = 0U;
+    taskENTER_CRITICAL(&s_state_lock);
+    raw_target = s_autonomous_cfg.windows_pos_a_target;
+    taskEXIT_CRITICAL(&s_state_lock);
+    return ((float)raw_target) / 10.0f;
   }
 
   uint16_t raw_target = 0;
@@ -2164,6 +3506,79 @@ float modbus_get_window_a_target_percent(void) {
   if (raw_target > 1000U) {
     raw_target = 1000U;
   }
+  return ((float)raw_target) / 10.0f;
+}
+
+static uint16_t modbus_get_autonomous_water_setpoint_raw(
+    modbus_water_channel_t channel) {
+  uint16_t raw_target = 0U;
+  taskENTER_CRITICAL(&s_state_lock);
+  switch (channel) {
+  case MODBUS_WATER_CHANNEL_RAIL:
+    raw_target = s_autonomous_cfg.sp_water_rail;
+    break;
+  case MODBUS_WATER_CHANNEL_GROW:
+    raw_target = s_autonomous_cfg.sp_water_grow;
+    break;
+  case MODBUS_WATER_CHANNEL_UPPER:
+    raw_target = s_autonomous_cfg.sp_water_upper;
+    break;
+  case MODBUS_WATER_CHANNEL_UNDERTRAY:
+    raw_target = s_autonomous_cfg.sp_water_undertray;
+    break;
+  case MODBUS_WATER_CHANNEL_COUNT:
+  default:
+    raw_target = 0U;
+    break;
+  }
+  taskEXIT_CRITICAL(&s_state_lock);
+  return raw_target;
+}
+
+static uint16_t modbus_get_remote_water_setpoint_raw(modbus_water_channel_t channel) {
+  uint16_t raw_target = 0U;
+
+  if (s_mbc_slave_handler == NULL) {
+    return raw_target;
+  }
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  switch (channel) {
+  case MODBUS_WATER_CHANNEL_RAIL:
+    raw_target = s_holding_regs[MODBUS_HREG_SP_WATER_RAIL];
+    break;
+  case MODBUS_WATER_CHANNEL_GROW:
+    raw_target = s_holding_regs[MODBUS_HREG_SP_WATER_GROW];
+    break;
+  case MODBUS_WATER_CHANNEL_UPPER:
+    raw_target = s_holding_regs[MODBUS_HREG_SP_WATER_UPPER];
+    break;
+  case MODBUS_WATER_CHANNEL_UNDERTRAY:
+    raw_target = s_holding_regs[MODBUS_HREG_SP_WATER_UNDERTRAY];
+    break;
+  case MODBUS_WATER_CHANNEL_COUNT:
+  default:
+    raw_target = 0U;
+    break;
+  }
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+
+  return raw_target;
+}
+
+float modbus_get_water_setpoint_c(modbus_water_channel_t channel) {
+  uint16_t raw_target = 0U;
+
+  if (modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS) {
+    raw_target = modbus_get_autonomous_water_setpoint_raw(channel);
+  } else {
+    raw_target = modbus_get_remote_water_setpoint_raw(channel);
+  }
+
+  if (raw_target > 1200U) {
+    raw_target = 1200U;
+  }
+
   return ((float)raw_target) / 10.0f;
 }
 

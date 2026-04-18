@@ -18,14 +18,25 @@
 - На I2C подключены: ADS1115, DS3231
 
 ### 2.3 Исполнительные Механизмы
-- RLL400 OPEN: GPIO18
+- RLL400 OPEN: временно не используется
 - RLL400 CLOSE: GPIO19
-- 3-way valve OPEN: GPIO32
-- 3-way valve CLOSE: GPIO33
+- 3-way valve OPEN: через `74HC595 Q2`
+- 3-way valve CLOSE: через `74HC595 Q3`
+
+### 2.3.1 74HC595
+- ESP32 GPIO2 -> `SER/DS`
+- ESP32 GPIO4 -> `SHCP/SRCLK`
+- ESP32 GPIO18 -> `STCP/RCLK`
+- `Q0` -> Relay 1
+- `Q1` -> Relay 2
+- `Q2` -> 3-way valve OPEN
+- `Q3` -> 3-way valve CLOSE
+- В текущей реализации свет и один `3-way valve` управляются через `74HC595`.
+- `RLL400` временно отключен, так как GPIO18 переиспользован под latch `74HC595`.
 
 ### 2.4 Освещение
-- Relay 1: GPIO4
-- Relay 2: GPIO2
+- Relay 1: через `74HC595 Q0`
+- Relay 2: через `74HC595 Q1`
 - Суммарная мощность для `135 LIGHT_OUTPUT_PERCENT`:
   - `00` -> `0%`
   - `10` или `01` -> `50%`

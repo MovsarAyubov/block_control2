@@ -1,5 +1,7 @@
 #pragma once
 
+#include "esp_err.h"
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -137,6 +139,14 @@ typedef enum {
   MODBUS_WEATHER_SET_RESULT_NOOP = 5,
 } modbus_weather_set_result_t;
 
+typedef enum {
+  MODBUS_WATER_CHANNEL_RAIL = 0,
+  MODBUS_WATER_CHANNEL_GROW = 1,
+  MODBUS_WATER_CHANNEL_UPPER = 2,
+  MODBUS_WATER_CHANNEL_UNDERTRAY = 3,
+  MODBUS_WATER_CHANNEL_COUNT = 4,
+} modbus_water_channel_t;
+
 typedef bool (*modbus_rtc_get_time_cb_t)(uint8_t *hour, uint8_t *minute,
                                          uint8_t *second, void *ctx);
 typedef bool (*modbus_rtc_set_time_cb_t)(uint8_t hour, uint8_t minute,
@@ -155,8 +165,11 @@ void modbus_set_light_current_time(uint8_t hour, uint8_t minute, uint8_t second)
 uint8_t modbus_get_light_percent(void);
 void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on);
 void modbus_set_solar_radiation(float radiation);
+esp_err_t modbus_handle_ascii_command(const char *line, char *response,
+                                      size_t response_len);
 
 float modbus_get_window_a_target_percent(void);
+float modbus_get_water_setpoint_c(modbus_water_channel_t channel);
 modbus_mode_state_t modbus_get_mode_state(void);
 bool modbus_is_autonomous(void);
 

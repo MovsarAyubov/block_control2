@@ -51,6 +51,49 @@
 - `126` ACTIVE_CTRL_VERSION_HI
 - `127` ACTIVE_CTRL_VERSION_LO
 
+### Water Valve Channels
+- `valve_3way` component controls one physical 3-way valve per handle
+- If the device has two valves, create two independent `valve_3way` handles
+- `106 SP_WATER_RAIL` -> setpoint for rail valve
+- `107 SP_WATER_GROW` -> setpoint for grow valve
+- `108 SP_WATER_UPPER` -> setpoint for upper valve
+- `109 SP_WATER_UNDERTRAY` -> setpoint for undertray valve
+- Actual water temperature is measured locally by the ESP32 via `max31865`
+- The server sends only the target setpoint for the selected circuit
+- Control rule: if `actual_temp > setpoint + hysteresis`, command `CLOSE`
+- Control rule: if `actual_temp < setpoint - hysteresis`, command `OPEN`
+- Inside the hysteresis band both GPIO outputs are forced `OFF`
+- Each valve channel has an interlock: `OPEN` and `CLOSE` outputs cannot be active at the same time
+
+### 74HC595 Output Mapping
+- ESP32 `GPIO2` -> `74HC595 SER/DS`
+- ESP32 `GPIO4` -> `74HC595 SHCP/SRCLK`
+- ESP32 `GPIO18` -> `74HC595 STCP/RCLK`
+- `Q0` -> Light relay 1
+- `Q1` -> Light relay 2
+- `Q2` -> 3-way valve `OPEN`
+- `Q3` -> 3-way valve `CLOSE`
+- Current implementation uses `74HC595` for the two light relays and one `3-way valve`
+
+### Bluetooth ASCII aliases for autonomous setpoints
+- Required: `103..109`, `111..112`, `117..118`, `122`
+- `103` -> `win_a_pos`
+- `104` -> `win_b_pos`
+- `105` -> `curt_pos`
+- `106` -> `sp_rail`
+- `107` -> `sp_grow`
+- `108` -> `sp_upper`
+- `109` -> `sp_under`
+- `111` -> `l1_on`
+- `112` -> `l1_off`
+- `113..115` -> not used in autonomous Bluetooth control
+- `117` -> `l2_on`
+- `118` -> `l2_off`
+- `119..121` -> not used in autonomous Bluetooth control
+- `122` -> `light_hyst`
+- Optional: `110` -> `l1_en`, `116` -> `l2_en`
+- See `docs/BLUETOOTH_ASCII.md` for command examples.
+
 ## Light Runtime
 - `134` LIGHT_CURRENT_DLI_JCM2 (`RW`, текущее накопленное `Дж/см²`, пишет мастер)
 - `135` LIGHT_OUTPUT_PERCENT (`RO`, суммарный выход `0/50/100`)
