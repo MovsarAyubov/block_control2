@@ -38,8 +38,8 @@ static const char *TAG = "APP";
 // MAX31865 Config (HSPI)
 #define MAX31865_HOST SPI2_HOST
 #define MAX31865_MISO 12
-#define MAX31865_MOSI 13
-#define MAX31865_CLK 14
+#define MAX31865_MOSI 14
+#define MAX31865_CLK 13
 #define MAX31865_CS 15
 #define MAX31865_CS2 5
 #define MAX31865_RREF 1999.0f

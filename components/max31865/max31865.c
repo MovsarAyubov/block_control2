@@ -169,11 +169,28 @@ esp_err_t max31865_init(const max31865_config_t *config,
   }
 
   // Write configuration
-  write_reg(ctx->spi, MAX31865_CONFIG_REG, config_byte);
+  ret = write_reg(ctx->spi, MAX31865_CONFIG_REG, config_byte);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write config register: %s", esp_err_to_name(ret));
+    spi_bus_remove_device(ctx->spi);
+    free(ctx);
+    return ret;
+  }
+
+  uint8_t readback_cfg = 0;
+  ret = read_reg(ctx->spi, MAX31865_CONFIG_REG, &readback_cfg);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read back config register: %s",
+             esp_err_to_name(ret));
+    spi_bus_remove_device(ctx->spi);
+    free(ctx);
+    return ret;
+  }
 
   *ret_handle = ctx;
-  ESP_LOGI(TAG, "Initialized MAX31865 (Host: %d, CS: %d, 3-Wire: %d)",
-           config->host, config->cs_io_num, config->three_wire);
+  ESP_LOGI(TAG,
+           "Initialized MAX31865 (Host: %d, CS: %d, 3-Wire: %d, CFG=0x%02X)",
+           config->host, config->cs_io_num, config->three_wire, readback_cfg);
 
   return ESP_OK;
 }
@@ -188,23 +205,47 @@ esp_err_t max31865_read_temp(max31865_handle_t handle, float *out_temp) {
   // 1-Shot bit. Let's read current config, add 1-shot bit, write back.
 
   uint8_t cfg;
-  read_reg(ctx->spi, MAX31865_CONFIG_REG, &cfg);
+  esp_err_t ret = read_reg(ctx->spi, MAX31865_CONFIG_REG, &cfg);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read config register: %s", esp_err_to_name(ret));
+    return ret;
+  }
 
   // Set 1-Shot bit and ensure BIAS is on
   cfg |= MAX31865_CONFIG_1SHOT | MAX31865_CONFIG_BIAS;
   if (ctx->cfg.three_wire)
     cfg |= MAX31865_CONFIG_3WIRE; // Ensure 3-wire is kept
 
-  write_reg(ctx->spi, MAX31865_CONFIG_REG, cfg);
+  ret = write_reg(ctx->spi, MAX31865_CONFIG_REG, cfg);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to trigger conversion: %s", esp_err_to_name(ret));
+    return ret;
+  }
 
   // Wait for conversion (approx 65ms for 50Hz filter)
   vTaskDelay(pdMS_TO_TICKS(70));
 
   // Read RTD Registers (0x01 MSB, 0x02 LSB)
   uint8_t data[2];
-  read_regs(ctx->spi, MAX31865_RTD_MSB_REG, data, 2);
+  ret = read_regs(ctx->spi, MAX31865_RTD_MSB_REG, data, 2);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read RTD registers: %s", esp_err_to_name(ret));
+    return ret;
+  }
 
   uint16_t rtd_raw = (data[0] << 8) | data[1];
+
+  if (rtd_raw == 0x0000 || rtd_raw == 0xFFFF) {
+    uint8_t fault = 0;
+    uint8_t cfg_now = 0;
+    (void)read_reg(ctx->spi, MAX31865_FAULT_STATUS_REG, &fault);
+    (void)read_reg(ctx->spi, MAX31865_CONFIG_REG, &cfg_now);
+    ESP_LOGE(TAG,
+             "Suspicious RTD raw value: 0x%04X (Fault: 0x%02X, Config: 0x%02X). "
+             "Likely SPI wiring/communication issue or inactive CS/CLK.",
+             rtd_raw, fault, cfg_now);
+    return ESP_FAIL;
+  }
 
   // Check Fault (D0)
   if (rtd_raw & 1) {

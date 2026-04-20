@@ -17,6 +17,15 @@
 - SCL: GPIO22
 - На I2C подключены: ADS1115, DS3231
 
+### 2.2.1 SPI / MAX31865
+- SPI host: `SPI2_HOST`
+- ESP32 `GPIO14` -> `MAX31865 SDI`
+- ESP32 `GPIO12` -> `MAX31865 SDO`
+- ESP32 `GPIO13` -> `MAX31865 CLK`
+- ESP32 `GPIO15` -> `MAX31865 CS1`
+- ESP32 `GPIO5` -> `MAX31865 CS2`
+- Оба `MAX31865` используют общие линии `SDI/SDO/CLK`, различается только `CS`.
+
 ### 2.3 Исполнительные Механизмы
 - RLL400 OPEN: временно не используется
 - RLL400 CLOSE: GPIO19
