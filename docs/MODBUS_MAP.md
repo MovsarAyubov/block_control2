@@ -183,6 +183,77 @@
 - `5` NOOP
 - `4` FAILED
 
+## Window Control, `171..224`
+- `171` WINDOWS_CTRL_MODE: `0=AUTO`, `1=MANUAL`
+- `172` WINDOWS_FORCE_SAFE_CMD
+- `173` WINDOWS_TEMP_SETPOINT, `x10 C`
+- `174` WINDOWS_SAFE_MIN_PERCENT, `x10 %`
+- `175` WINDOWS_WIND_LIMIT, legacy/default threshold, `x10 m/s`
+- `176` WINDOWS_WIND_STORM, common storm threshold, `x10 m/s`
+- `177` WINDOWS_WIND_RECOVER, storm recovery threshold, `x10 m/s`
+- `178` WINDOW_A_AZIMUTH_DEG
+- `179` WINDOWS_WIND_SECTOR_HALF_WIDTH_DEG
+- `180` WINDOWS_TEMP_STEP_C, `x10 C`
+- `181` WINDOWS_TEMP_STEP_HYST_C, `x10 C`
+- `182` RLL400_TARGET_HYST_PERCENT, `x10 %`
+- `183` RLL400_MOTION_DELTA_PERCENT, `x10 %`
+- `184` RLL400_NO_MOTION_TIMEOUT_MS
+- `185` WINDOW_A_FAULT_RESET_TOKEN
+- `186` WINDOW_B_FAULT_RESET_TOKEN
+- `187` WINDOWS_STATUS_BITS
+- `188` WINDOW_A_STATUS_BITS
+- `189` WINDOW_B_STATUS_BITS
+- `190` WINDOW_A_FAULT_CODE
+- `191` WINDOW_B_FAULT_CODE
+- `192` AIR_TEMP_SENSOR_STATUS
+- `193` WINDOW_A_LOCAL_MANUAL_ACTIVE
+- `194` WINDOW_B_LOCAL_MANUAL_ACTIVE
+- `195` WINDOWS_AUTO_ALGO_MODE: `0=TEMP`, `1=HUMIDITY`
+- `196` WINDOWS_HUM_SETPOINT, `x10 %`
+- `197` WINDOWS_HUM_STEP, `x10 %`
+- `198` WINDOWS_HUM_STEP_HYST, `x10 %`
+- `199` WINDOWS_COLD_CLOSE_DELTA, `x10 C`
+- `200` WINDOWS_COLD_CLOSE_HYST, `x10 C`
+- `201` WINDOWS_WINDWARD_MIN_PERCENT, `x10 %`
+- `202` WINDOWS_WINDWARD_MAX_PERCENT, `x10 %`
+- `203` WINDOWS_WINDWARD_SPEED_THRESHOLD, `x10 m/s`
+- `204` WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS, `x10 %/m/s`
+- `205` WINDOWS_LEEWARD_MIN_PERCENT, `x10 %`
+- `206` WINDOWS_LEEWARD_MAX_PERCENT, `x10 %`
+- `207` WINDOWS_LEEWARD_SPEED_THRESHOLD, `x10 m/s`
+- `208` WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS, `x10 %/m/s`
+- `209` WINDOWS_WINDWARD_LAG_PERCENT, `x10 %`
+- `210` WINDOWS_RAIN_MODE: `0=OFF`, `1=WINDWARD`
+- `211` WINDOWS_RAIN_WINDWARD_PERCENT, `x10 %`
+- `212` WINDOWS_WEATHER_STALE_POLICY: `0=CLOSE_SAFE`, `1=IGNORE`
+- `213` WINDOWS_BASE_TARGET_A, `x10 %`, RO
+- `214` WINDOWS_BASE_TARGET_B, `x10 %`, RO
+- `215` WINDOWS_EFFECTIVE_TARGET_A, `x10 %`, RO
+- `216` WINDOWS_EFFECTIVE_TARGET_B, `x10 %`, RO
+- `217` WINDOWS_ACTIVE_PROTECTION_BITS, RO
+- `218` WINDOWS_WINDWARD_SIDE: `0=NONE`, `1=A`, `2=B`, `3=BOTH_UNKNOWN`, RO
+- `219` WINDOWS_TEMP_STEP_TARGET_PERCENT, `x10 %`
+- `220` WINDOWS_TEMP_STEP_MAX_INDEX, legacy/reserved
+- `221` WINDOWS_HUM_STEP_TARGET_PERCENT, `x10 %`
+- `222` WINDOWS_HUM_STEP_MAX_INDEX, legacy/reserved
+- `223` WINDOWS_WEATHER_STALE_TIMEOUT_MS
+- `224` WINDOWS_WEATHER_SOURCE_AGE_S
+
+### Window Protection Bits
+- `bit0` force safe active
+- `bit1` weather stale safe policy active
+- `bit2` storm active
+- `bit3` cold close active
+- `bit4` rain limiting A
+- `bit5` rain limiting B
+- `bit6` wind limiting A
+- `bit7` wind limiting B
+- `bit8` temperature sensor fault
+- `bit9` humidity sensor fault
+
+Weather is treated as unsafe/stale by the window controller when the weather
+snapshot is missing, stale by age, or `WEATHER_STATUS_BITS != 0`.
+
 ## Persist/Reboot
 - Active light config и `ACTIVE_CTRL_VERSION` сохраняются в NVS (`light_state`) с CRC32.
 - После reboot staging и active light config восстанавливаются из NVS.

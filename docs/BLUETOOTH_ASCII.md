@@ -16,13 +16,14 @@ SPP with plain ASCII commands.
 - Changes take effect immediately while the node is in `AUTONOMOUS` mode.
 - The updated autonomous configuration survives reboot.
 - `REMOTE` mode logic is unchanged; Modbus still controls remote setpoints.
+- Window automation tuning commands write runtime holding registers directly.
 - Weather mock commands update the active weather snapshot in RAM immediately.
 - Weather mock data does not survive reboot.
+- Window safety treats weather as unsafe when `wx_stat` is non-zero.
 
 ## Short Names
 
-The primary Bluetooth interface uses short readable names no longer than
-`12` characters.
+The primary Bluetooth interface uses short readable names.
 
 ### Required Setpoints
 
@@ -40,6 +41,33 @@ The primary Bluetooth interface uses short readable names no longer than
 | `117` `LIGHT_R2_ON_HHMM` | `l2_on` | `set l2_on 14:00` |
 | `118` `LIGHT_R2_OFF_HHMM` | `l2_off` | `set l2_off 22:00` |
 | `122` `LIGHT_HYST_SEC` | `light_hyst` | `set light_hyst 30` |
+| `171` `WINDOWS_CTRL_MODE` | `win_mode` | `set win_mode manual` |
+
+### Window Automation Names
+
+| Modbus | Short name | Example |
+| --- | --- | --- |
+| `195` `WINDOWS_AUTO_ALGO_MODE` | `win_alg` | `set win_alg temp` |
+| `219` `WINDOWS_TEMP_STEP_TARGET_PERCENT` | `temp_open` | `set temp_open 20` |
+| `196` `WINDOWS_HUM_SETPOINT` | `hum_sp` | `set hum_sp 80` |
+| `197` `WINDOWS_HUM_STEP` | `hum_step` | `set hum_step 5` |
+| `198` `WINDOWS_HUM_STEP_HYST` | `hum_hyst` | `set hum_hyst 1` |
+| `221` `WINDOWS_HUM_STEP_TARGET_PERCENT` | `hum_open` | `set hum_open 20` |
+| `199` `WINDOWS_COLD_CLOSE_DELTA` | `cold_close` | `set cold_close 2` |
+| `200` `WINDOWS_COLD_CLOSE_HYST` | `cold_hyst` | `set cold_hyst 0.5` |
+| `201` `WINDOWS_WINDWARD_MIN_PERCENT` | `windward_min` | `set windward_min 0` |
+| `202` `WINDOWS_WINDWARD_MAX_PERCENT` | `windward_max` | `set windward_max 60` |
+| `203` `WINDOWS_WINDWARD_SPEED_THRESHOLD` | `windward_thr` | `set windward_thr 1` |
+| `204` `WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS` | `windward_reduce` | `set windward_reduce 10` |
+| `205` `WINDOWS_LEEWARD_MIN_PERCENT` | `leeward_min` | `set leeward_min 0` |
+| `206` `WINDOWS_LEEWARD_MAX_PERCENT` | `leeward_max` | `set leeward_max 100` |
+| `207` `WINDOWS_LEEWARD_SPEED_THRESHOLD` | `leeward_thr` | `set leeward_thr 8` |
+| `208` `WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS` | `leeward_reduce` | `set leeward_reduce 0` |
+| `209` `WINDOWS_WINDWARD_LAG_PERCENT` | `wind_lag` | `set wind_lag 20` |
+| `210` `WINDOWS_RAIN_MODE` | `rain_mode` | `set rain_mode windward` |
+| `211` `WINDOWS_RAIN_WINDWARD_PERCENT` | `rain_pos` | `set rain_pos 0` |
+| `223` `WINDOWS_WEATHER_STALE_TIMEOUT_MS` | `wx_stale_ms` | `set wx_stale_ms 20000` |
+| `224` `WINDOWS_WEATHER_SOURCE_AGE_S` | `wx_age_max` | `set wx_age_max 20` |
 
 ### Not Used In Autonomous Bluetooth Control
 
@@ -82,6 +110,7 @@ The primary Bluetooth interface uses short readable names no longer than
 - `show autonomous`
 - `show mode`
 - `show weather`
+- `show windows`
 - `show light r1`
 - `show light r2`
 
@@ -89,6 +118,31 @@ The primary Bluetooth interface uses short readable names no longer than
 
 - `set win_a_pos 50`
 - `set win_b_pos 25.5`
+- `set_a_pos 50`
+- `set_b_pos 25.5`
+- `set win_mode manual`
+- `set win_alg temp`
+- `set win_alg hum`
+- `set temp_open 20`
+- `set hum_sp 80`
+- `set hum_step 5`
+- `set hum_hyst 1`
+- `set hum_open 20`
+- `set cold_close 2`
+- `set cold_hyst 0.5`
+- `set windward_min 0`
+- `set windward_max 60`
+- `set windward_thr 1`
+- `set windward_reduce 10`
+- `set leeward_min 0`
+- `set leeward_max 100`
+- `set leeward_thr 8`
+- `set leeward_reduce 0`
+- `set wind_lag 20`
+- `set rain_mode windward`
+- `set rain_pos 0`
+- `set wx_stale_ms 20000`
+- `set wx_age_max 20`
 - `set curt_pos 100`
 - `set sp_rail 35.0`
 - `set sp_grow 32.0`
@@ -113,6 +167,15 @@ The primary Bluetooth interface uses short readable names no longer than
 Values:
 
 - Position targets are in percent, valid range `0..100`
+- `win_mode` accepts `auto`, `manual`, `0`, or `1`
+- `win_alg` accepts `temp`, `hum`, `temperature`, `humidity`, `0`, or `1`
+- Window position targets are accepted only while system `mode=AUTONOMOUS`
+- Window automation percent values use `0..100`
+- `wx_stale_ms` is weather receive timeout in milliseconds, effective range `1000..60000`; `0` falls back to default
+- `wx_age_max` is maximum weather source age in seconds, effective range `1..600`; `0` falls back to default
+- Wind thresholds are in `m/s`, valid range `0..100.0`
+- Wind reduction is in `% per m/s` above the role threshold
+- `rain_mode` accepts `off`, `on`, or `windward`
 - Water setpoints are in degrees Celsius, valid range `0..120.0`
 - Time accepts either `HH:MM` or `HHMM`
 - Threshold, DLI and hysteresis are integer values
@@ -157,10 +220,10 @@ Example:
 
 ```text
 set win_a_pos 50
-OK win_a_pos=50.0%
+OK win_a_pos=50.0% requested=50.0% mode=AUTO
 
-show autonomous
-OK mode=AUTONOMOUS reason=MASTER_TIMEOUT windows[a=50.0% b=0.0%] ...
+show windows
+OK windows win_mode=MANUAL alg=TEMP windward=A requested[a=50.0% b=0.0%] base[a=50.0% b=0.0%] effective[a=40.0% b=60.0%] pos[a=... b=...] prot=0x00C0 ...
 
 set wx_solar 650
 OK wx_solar=650W/m2 token=1 result=APPLIED

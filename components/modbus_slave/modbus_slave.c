@@ -49,6 +49,43 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_LIGHT_RELAY_COUNT 2
 #define MODBUS_LIGHT_ZONE_DELAY_STEP_SEC 10U
 #define MODBUS_LIGHT_AUTO_APPLY_SETTLE_MS 250U
+#define MODBUS_WINDOWS_DEFAULT_CTRL_MODE MODBUS_WINDOWS_CTRL_MODE_AUTO
+#define MODBUS_WINDOWS_DEFAULT_FORCE_SAFE_CMD 0U
+#define MODBUS_WINDOWS_DEFAULT_TEMP_SETPOINT 250U
+#define MODBUS_WINDOWS_DEFAULT_SAFE_MIN_PERCENT 0U
+#define MODBUS_WINDOWS_DEFAULT_WIND_LIMIT 80U
+#define MODBUS_WINDOWS_DEFAULT_WIND_STORM 150U
+#define MODBUS_WINDOWS_DEFAULT_WIND_RECOVER 60U
+#define MODBUS_WINDOWS_DEFAULT_AZIMUTH_DEG 0U
+#define MODBUS_WINDOWS_DEFAULT_WIND_SECTOR_HALF_WIDTH_DEG 45U
+#define MODBUS_WINDOWS_DEFAULT_TEMP_STEP_C 30U
+#define MODBUS_WINDOWS_DEFAULT_TEMP_STEP_HYST_C 5U
+#define MODBUS_WINDOWS_DEFAULT_TEMP_STEP_TARGET_PERCENT 200U
+#define MODBUS_WINDOWS_DEFAULT_TEMP_STEP_MAX_INDEX 5U
+#define MODBUS_WINDOWS_DEFAULT_AUTO_ALGO_MODE MODBUS_WINDOWS_AUTO_ALGO_TEMP
+#define MODBUS_WINDOWS_DEFAULT_HUM_SETPOINT 800U
+#define MODBUS_WINDOWS_DEFAULT_HUM_STEP 50U
+#define MODBUS_WINDOWS_DEFAULT_HUM_STEP_HYST 10U
+#define MODBUS_WINDOWS_DEFAULT_HUM_STEP_TARGET_PERCENT 200U
+#define MODBUS_WINDOWS_DEFAULT_HUM_STEP_MAX_INDEX 5U
+#define MODBUS_WINDOWS_DEFAULT_COLD_CLOSE_DELTA 20U
+#define MODBUS_WINDOWS_DEFAULT_COLD_CLOSE_HYST 5U
+#define MODBUS_WINDOWS_DEFAULT_WINDWARD_MIN_PERCENT 0U
+#define MODBUS_WINDOWS_DEFAULT_WINDWARD_MAX_PERCENT 0U
+#define MODBUS_WINDOWS_DEFAULT_WINDWARD_REDUCTION_PERCENT_PER_MS 0U
+#define MODBUS_WINDOWS_DEFAULT_LEEWARD_MIN_PERCENT 0U
+#define MODBUS_WINDOWS_DEFAULT_LEEWARD_MAX_PERCENT 1000U
+#define MODBUS_WINDOWS_DEFAULT_LEEWARD_REDUCTION_PERCENT_PER_MS 0U
+#define MODBUS_WINDOWS_DEFAULT_WINDWARD_LAG_PERCENT 0U
+#define MODBUS_WINDOWS_DEFAULT_RAIN_MODE MODBUS_WINDOWS_RAIN_MODE_WINDWARD
+#define MODBUS_WINDOWS_DEFAULT_RAIN_WINDWARD_PERCENT 0U
+#define MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_POLICY \
+  MODBUS_WINDOWS_WEATHER_STALE_CLOSE_SAFE
+#define MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_TIMEOUT_MS 20000U
+#define MODBUS_WINDOWS_DEFAULT_WEATHER_SOURCE_AGE_S 20U
+#define MODBUS_WINDOWS_DEFAULT_TARGET_HYST_PERCENT 10U
+#define MODBUS_WINDOWS_DEFAULT_MOTION_DELTA_PERCENT 5U
+#define MODBUS_WINDOWS_DEFAULT_NO_MOTION_TIMEOUT_MS 3000U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -307,6 +344,8 @@ static esp_err_t apply_ascii_autonomous_update(const autonomous_ctrl_cfg_t *cfg,
                                                char *response,
                                                size_t response_len,
                                                const char *success_text);
+static uint16_t modbus_read_holding_reg(uint16_t reg_index);
+static void modbus_write_holding_reg(uint16_t reg_index, uint16_t value);
 
 static modbus_handler_wrap_t s_handler_wraps[MODBUS_FC_COUNT] = {
     {.fc = 0x01, .original = NULL, .wrapper = modbus_fc_01_wrapper},
@@ -2039,6 +2078,99 @@ void modbus_init(void) {
   s_holding_regs[MODBUS_HREG_WEATHER_SET_TOKEN] = 0;
   s_holding_regs[MODBUS_HREG_WEATHER_SET_APPLIED_TOKEN] = 0;
   s_holding_regs[MODBUS_HREG_WEATHER_SET_RESULT] = MODBUS_WEATHER_SET_RESULT_NONE;
+  s_holding_regs[MODBUS_HREG_WINDOWS_CTRL_MODE] =
+      MODBUS_WINDOWS_DEFAULT_CTRL_MODE;
+  s_holding_regs[MODBUS_HREG_WINDOWS_FORCE_SAFE_CMD] =
+      MODBUS_WINDOWS_DEFAULT_FORCE_SAFE_CMD;
+  s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_SETPOINT] =
+      MODBUS_WINDOWS_DEFAULT_TEMP_SETPOINT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_SAFE_MIN_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_SAFE_MIN_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WIND_LIMIT] =
+      MODBUS_WINDOWS_DEFAULT_WIND_LIMIT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WIND_STORM] =
+      MODBUS_WINDOWS_DEFAULT_WIND_STORM;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WIND_RECOVER] =
+      MODBUS_WINDOWS_DEFAULT_WIND_RECOVER;
+  s_holding_regs[MODBUS_HREG_WINDOW_A_AZIMUTH_DEG] =
+      MODBUS_WINDOWS_DEFAULT_AZIMUTH_DEG;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WIND_SECTOR_HALF_WIDTH_DEG] =
+      MODBUS_WINDOWS_DEFAULT_WIND_SECTOR_HALF_WIDTH_DEG;
+  s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_C] =
+      MODBUS_WINDOWS_DEFAULT_TEMP_STEP_C;
+  s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_HYST_C] =
+      MODBUS_WINDOWS_DEFAULT_TEMP_STEP_HYST_C;
+  s_holding_regs[MODBUS_HREG_RLL400_TARGET_HYST_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_TARGET_HYST_PERCENT;
+  s_holding_regs[MODBUS_HREG_RLL400_MOTION_DELTA_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_MOTION_DELTA_PERCENT;
+  s_holding_regs[MODBUS_HREG_RLL400_NO_MOTION_TIMEOUT_MS] =
+      MODBUS_WINDOWS_DEFAULT_NO_MOTION_TIMEOUT_MS;
+  s_holding_regs[MODBUS_HREG_WINDOW_A_FAULT_RESET_TOKEN] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_B_FAULT_RESET_TOKEN] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_A_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_B_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_A_FAULT_CODE] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_B_FAULT_CODE] = 0U;
+  s_holding_regs[MODBUS_HREG_AIR_TEMP_SENSOR_STATUS] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_A_LOCAL_MANUAL_ACTIVE] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOW_B_LOCAL_MANUAL_ACTIVE] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_AUTO_ALGO_MODE] =
+      MODBUS_WINDOWS_DEFAULT_AUTO_ALGO_MODE;
+  s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_TARGET_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_TEMP_STEP_TARGET_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_MAX_INDEX] =
+      MODBUS_WINDOWS_DEFAULT_TEMP_STEP_MAX_INDEX;
+  s_holding_regs[MODBUS_HREG_WINDOWS_HUM_SETPOINT] =
+      MODBUS_WINDOWS_DEFAULT_HUM_SETPOINT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP] =
+      MODBUS_WINDOWS_DEFAULT_HUM_STEP;
+  s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP_HYST] =
+      MODBUS_WINDOWS_DEFAULT_HUM_STEP_HYST;
+  s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP_TARGET_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_HUM_STEP_TARGET_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP_MAX_INDEX] =
+      MODBUS_WINDOWS_DEFAULT_HUM_STEP_MAX_INDEX;
+  s_holding_regs[MODBUS_HREG_WINDOWS_COLD_CLOSE_DELTA] =
+      MODBUS_WINDOWS_DEFAULT_COLD_CLOSE_DELTA;
+  s_holding_regs[MODBUS_HREG_WINDOWS_COLD_CLOSE_HYST] =
+      MODBUS_WINDOWS_DEFAULT_COLD_CLOSE_HYST;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_MIN_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_WINDWARD_MIN_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_MAX_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_WINDWARD_MAX_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_SPEED_THRESHOLD] =
+      MODBUS_WINDOWS_DEFAULT_WIND_LIMIT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS] =
+      MODBUS_WINDOWS_DEFAULT_WINDWARD_REDUCTION_PERCENT_PER_MS;
+  s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_MIN_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_LEEWARD_MIN_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_MAX_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_LEEWARD_MAX_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_SPEED_THRESHOLD] =
+      MODBUS_WINDOWS_DEFAULT_WIND_LIMIT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS] =
+      MODBUS_WINDOWS_DEFAULT_LEEWARD_REDUCTION_PERCENT_PER_MS;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_LAG_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_WINDWARD_LAG_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_RAIN_MODE] =
+      MODBUS_WINDOWS_DEFAULT_RAIN_MODE;
+  s_holding_regs[MODBUS_HREG_WINDOWS_RAIN_WINDWARD_PERCENT] =
+      MODBUS_WINDOWS_DEFAULT_RAIN_WINDWARD_PERCENT;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_STALE_POLICY] =
+      MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_POLICY;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS] =
+      MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_TIMEOUT_MS;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S] =
+      MODBUS_WINDOWS_DEFAULT_WEATHER_SOURCE_AGE_S;
+  s_holding_regs[MODBUS_HREG_WINDOWS_BASE_TARGET_A] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_BASE_TARGET_B] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_A] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_B] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_ACTIVE_PROTECTION_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_SIDE] =
+      MODBUS_WINDOWS_WINDWARD_SIDE_NONE;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_apply_pending = false;
@@ -2585,6 +2717,30 @@ static const char *mode_to_string(modbus_mode_state_t mode) {
   return (mode == MODBUS_MODE_AUTONOMOUS) ? "AUTONOMOUS" : "REMOTE";
 }
 
+static const char *windows_ctrl_mode_to_string(modbus_windows_ctrl_mode_t mode) {
+  return (mode == MODBUS_WINDOWS_CTRL_MODE_MANUAL) ? "MANUAL" : "AUTO";
+}
+
+static const char *
+windows_auto_algo_to_string(modbus_windows_auto_algo_mode_t mode) {
+  return (mode == MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY) ? "HUMIDITY" : "TEMP";
+}
+
+static const char *
+windows_windward_side_to_string(modbus_windows_windward_side_t side) {
+  switch (side) {
+  case MODBUS_WINDOWS_WINDWARD_SIDE_A:
+    return "A";
+  case MODBUS_WINDOWS_WINDWARD_SIDE_B:
+    return "B";
+  case MODBUS_WINDOWS_WINDWARD_SIDE_BOTH_UNKNOWN:
+    return "BOTH_UNKNOWN";
+  case MODBUS_WINDOWS_WINDWARD_SIDE_NONE:
+  default:
+    return "NONE";
+  }
+}
+
 static const char *reason_to_string(modbus_mode_reason_t reason) {
   switch (reason) {
   case MODBUS_REASON_MASTER_TIMEOUT:
@@ -2791,6 +2947,59 @@ static void format_weather_summary(char *response, size_t response_len) {
            (unsigned)snapshot.source_age_s);
 }
 
+static void format_windows_summary(char *response, size_t response_len) {
+  if (response == NULL || response_len == 0U) {
+    return;
+  }
+
+  const modbus_windows_ctrl_mode_t ctrl_mode =
+      (modbus_read_holding_reg(MODBUS_HREG_WINDOWS_CTRL_MODE) ==
+       (uint16_t)MODBUS_WINDOWS_CTRL_MODE_MANUAL)
+          ? MODBUS_WINDOWS_CTRL_MODE_MANUAL
+          : MODBUS_WINDOWS_CTRL_MODE_AUTO;
+  const modbus_windows_auto_algo_mode_t algo_mode =
+      (modbus_read_holding_reg(MODBUS_HREG_WINDOWS_AUTO_ALGO_MODE) ==
+       (uint16_t)MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY)
+          ? MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY
+          : MODBUS_WINDOWS_AUTO_ALGO_TEMP;
+  const modbus_windows_windward_side_t windward_side =
+      (modbus_windows_windward_side_t)
+          modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WINDWARD_SIDE);
+
+  snprintf(response, response_len,
+           "OK windows win_mode=%s alg=%s windward=%s "
+           "requested[a=%.1f%% b=%.1f%%] base[a=%.1f%% b=%.1f%%] "
+           "effective[a=%.1f%% b=%.1f%%] pos[a=%.1f%% b=%.1f%%] "
+           "prot=0x%04X status[sys=0x%04X a=0x%04X b=0x%04X] "
+           "fault[a=%u b=%u]",
+           windows_ctrl_mode_to_string(ctrl_mode),
+           windows_auto_algo_to_string(algo_mode),
+           windows_windward_side_to_string(windward_side),
+           ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_A_TARGET)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_B_TARGET)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_BASE_TARGET_A)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_BASE_TARGET_B)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(
+                MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_A)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(
+                MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_B)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_A)) / 10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_B)) / 10.0f,
+           (unsigned)modbus_read_holding_reg(
+               MODBUS_HREG_WINDOWS_ACTIVE_PROTECTION_BITS),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_STATUS_BITS),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_WINDOW_A_STATUS_BITS),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_WINDOW_B_STATUS_BITS),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_WINDOW_A_FAULT_CODE),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_WINDOW_B_FAULT_CODE));
+}
+
 static esp_err_t apply_ascii_weather_update(const weather_snapshot_t *snapshot,
                                             char *response, size_t response_len,
                                             const char *success_text) {
@@ -2983,6 +3192,140 @@ static esp_err_t handle_ascii_weather_short_alias_command(size_t token_count,
   return ESP_ERR_NOT_SUPPORTED;
 }
 
+typedef struct {
+  const char *name;
+  uint16_t reg;
+  float min_value;
+  float max_value;
+  const char *unit;
+} windows_tenths_alias_t;
+
+static esp_err_t handle_ascii_window_settings_alias_command(
+    size_t token_count, char *tokens[], char *response, size_t response_len) {
+  if (token_count != 2U || tokens == NULL || response == NULL ||
+      response_len == 0U) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  const char *name = tokens[0];
+  const char *value = tokens[1];
+
+  if (strcmp(name, "win_alg") == 0) {
+    modbus_windows_auto_algo_mode_t mode = MODBUS_WINDOWS_AUTO_ALGO_TEMP;
+    if (strcmp(value, "temp") == 0 || strcmp(value, "temperature") == 0 ||
+        strcmp(value, "0") == 0) {
+      mode = MODBUS_WINDOWS_AUTO_ALGO_TEMP;
+    } else if (strcmp(value, "hum") == 0 || strcmp(value, "humidity") == 0 ||
+               strcmp(value, "1") == 0) {
+      mode = MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY;
+    } else {
+      snprintf(response, response_len, "ERR invalid windows algorithm");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    modbus_write_holding_reg(MODBUS_HREG_WINDOWS_AUTO_ALGO_MODE,
+                             (uint16_t)mode);
+    snprintf(response, response_len, "OK win_alg=%s",
+             windows_auto_algo_to_string(mode));
+    return ESP_OK;
+  }
+
+  if (strcmp(name, "rain_mode") == 0) {
+    uint16_t enabled = 0U;
+    modbus_windows_rain_mode_t mode = MODBUS_WINDOWS_RAIN_MODE_DISABLED;
+    if (parse_switch_ascii(value, &enabled)) {
+      mode = enabled ? MODBUS_WINDOWS_RAIN_MODE_WINDWARD
+                     : MODBUS_WINDOWS_RAIN_MODE_DISABLED;
+    } else if (strcmp(value, "windward") == 0) {
+      mode = MODBUS_WINDOWS_RAIN_MODE_WINDWARD;
+    } else {
+      snprintf(response, response_len, "ERR invalid rain mode");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    modbus_write_holding_reg(MODBUS_HREG_WINDOWS_RAIN_MODE, (uint16_t)mode);
+    snprintf(response, response_len, "OK rain_mode=%s",
+             (mode == MODBUS_WINDOWS_RAIN_MODE_WINDWARD) ? "WINDWARD" : "OFF");
+    return ESP_OK;
+  }
+
+  if (strcmp(name, "wx_stale_ms") == 0 || strcmp(name, "wx_age_max") == 0) {
+    uint16_t raw_value = 0U;
+    uint16_t max_value = UINT16_MAX;
+    uint16_t reg = 0U;
+
+    if (strcmp(name, "wx_stale_ms") == 0) {
+      max_value = 60000U;
+      reg = MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS;
+    } else {
+      max_value = 600U;
+      reg = MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S;
+    }
+
+    if (!parse_u16_ascii(value, max_value, &raw_value)) {
+      snprintf(response, response_len, "ERR invalid %s value", name);
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    modbus_write_holding_reg(reg, raw_value);
+    snprintf(response, response_len, "OK %s=%u", name, (unsigned)raw_value);
+    return ESP_OK;
+  }
+
+  static const windows_tenths_alias_t aliases[] = {
+      {"temp_open", MODBUS_HREG_WINDOWS_TEMP_STEP_TARGET_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"hum_sp", MODBUS_HREG_WINDOWS_HUM_SETPOINT, 0.0f, 100.0f, "%"},
+      {"hum_step", MODBUS_HREG_WINDOWS_HUM_STEP, 0.1f, 100.0f, "%"},
+      {"hum_hyst", MODBUS_HREG_WINDOWS_HUM_STEP_HYST, 0.0f, 100.0f, "%"},
+      {"hum_open", MODBUS_HREG_WINDOWS_HUM_STEP_TARGET_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"cold_close", MODBUS_HREG_WINDOWS_COLD_CLOSE_DELTA, 0.0f, 50.0f, "C"},
+      {"cold_hyst", MODBUS_HREG_WINDOWS_COLD_CLOSE_HYST, 0.0f, 50.0f, "C"},
+      {"windward_min", MODBUS_HREG_WINDOWS_WINDWARD_MIN_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"windward_max", MODBUS_HREG_WINDOWS_WINDWARD_MAX_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"windward_thr", MODBUS_HREG_WINDOWS_WINDWARD_SPEED_THRESHOLD, 0.0f,
+       100.0f, "m/s"},
+      {"windward_reduce",
+       MODBUS_HREG_WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS, 0.0f, 100.0f,
+       "%/m/s"},
+      {"leeward_min", MODBUS_HREG_WINDOWS_LEEWARD_MIN_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"leeward_max", MODBUS_HREG_WINDOWS_LEEWARD_MAX_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"leeward_thr", MODBUS_HREG_WINDOWS_LEEWARD_SPEED_THRESHOLD, 0.0f,
+       100.0f, "m/s"},
+      {"leeward_reduce", MODBUS_HREG_WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS,
+       0.0f, 100.0f, "%/m/s"},
+      {"wind_lag", MODBUS_HREG_WINDOWS_WINDWARD_LAG_PERCENT, 0.0f, 100.0f,
+       "%"},
+      {"rain_pos", MODBUS_HREG_WINDOWS_RAIN_WINDWARD_PERCENT, 0.0f, 100.0f,
+       "%"},
+  };
+
+  for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
+    if (strcmp(name, aliases[i].name) != 0) {
+      continue;
+    }
+
+    uint16_t raw_tenths = 0U;
+    if (!parse_tenths_ascii(value, aliases[i].min_value, aliases[i].max_value,
+                            &raw_tenths)) {
+      snprintf(response, response_len, "ERR invalid %s value", aliases[i].name);
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    modbus_write_holding_reg(aliases[i].reg, raw_tenths);
+    snprintf(response, response_len, "OK %s=%.1f%s", aliases[i].name,
+             ((float)raw_tenths) / 10.0f, aliases[i].unit);
+    return ESP_OK;
+  }
+
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
 static esp_err_t handle_ascii_short_alias_command(size_t token_count,
                                                   char *tokens[],
                                                   char *response,
@@ -2998,39 +3341,90 @@ static esp_err_t handle_ascii_short_alias_command(size_t token_count,
     return weather_result;
   }
 
+  esp_err_t window_settings_result = handle_ascii_window_settings_alias_command(
+      token_count, tokens, response, response_len);
+  if (window_settings_result != ESP_ERR_NOT_SUPPORTED) {
+    return window_settings_result;
+  }
+
   autonomous_ctrl_cfg_t cfg = {0};
   modbus_mode_state_t mode_snapshot = MODBUS_MODE_REMOTE;
   modbus_mode_reason_t reason_snapshot = MODBUS_REASON_NONE;
   snapshot_autonomous_state(&cfg, &mode_snapshot, &reason_snapshot);
-  (void)mode_snapshot;
   (void)reason_snapshot;
 
   const char *name = tokens[0];
   const char *value = tokens[1];
 
-  if (strcmp(name, "win_a_pos") == 0) {
+  if (strcmp(name, "win_mode") == 0 || strcmp(name, "windows_mode") == 0) {
+    modbus_windows_ctrl_mode_t ctrl_mode = MODBUS_WINDOWS_CTRL_MODE_AUTO;
+    if (strcmp(value, "auto") == 0 || strcmp(value, "0") == 0) {
+      ctrl_mode = MODBUS_WINDOWS_CTRL_MODE_AUTO;
+    } else if (strcmp(value, "manual") == 0 || strcmp(value, "1") == 0) {
+      ctrl_mode = MODBUS_WINDOWS_CTRL_MODE_MANUAL;
+    } else {
+      snprintf(response, response_len, "ERR invalid windows mode");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    modbus_write_holding_reg(MODBUS_HREG_WINDOWS_CTRL_MODE,
+                             (uint16_t)ctrl_mode);
+    snprintf(response, response_len, "OK win_mode=%s",
+             windows_ctrl_mode_to_string(ctrl_mode));
+    return ESP_OK;
+  }
+
+  if (strcmp(name, "win_a_pos") == 0 || strcmp(name, "set_a_pos") == 0) {
     uint16_t percent_tenths = 0U;
     if (!parse_tenths_ascii(value, 0.0f, 100.0f, &percent_tenths)) {
       snprintf(response, response_len, "ERR invalid percent value");
       return ESP_ERR_INVALID_ARG;
     }
+    if (mode_snapshot != MODBUS_MODE_AUTONOMOUS) {
+      snprintf(response, response_len,
+               "ERR windows target is available only in AUTONOMOUS mode");
+      return ESP_ERR_INVALID_STATE;
+    }
     cfg.windows_pos_a_target = percent_tenths;
-    char ok_text[48] = {0};
-    snprintf(ok_text, sizeof(ok_text), "win_a_pos=%.1f%%",
-             ((float)percent_tenths) / 10.0f);
+    modbus_write_holding_reg(MODBUS_HREG_WINDOWS_POS_A_TARGET, percent_tenths);
+    const modbus_windows_ctrl_mode_t ctrl_mode =
+        (modbus_read_holding_reg(MODBUS_HREG_WINDOWS_CTRL_MODE) ==
+         (uint16_t)MODBUS_WINDOWS_CTRL_MODE_MANUAL)
+            ? MODBUS_WINDOWS_CTRL_MODE_MANUAL
+            : MODBUS_WINDOWS_CTRL_MODE_AUTO;
+    char ok_text[80] = {0};
+    snprintf(ok_text, sizeof(ok_text),
+             "win_a_pos=%.1f%% requested=%.1f%% mode=%s",
+             ((float)percent_tenths) / 10.0f,
+             ((float)percent_tenths) / 10.0f,
+             windows_ctrl_mode_to_string(ctrl_mode));
     return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
   }
 
-  if (strcmp(name, "win_b_pos") == 0) {
+  if (strcmp(name, "win_b_pos") == 0 || strcmp(name, "set_b_pos") == 0) {
     uint16_t percent_tenths = 0U;
     if (!parse_tenths_ascii(value, 0.0f, 100.0f, &percent_tenths)) {
       snprintf(response, response_len, "ERR invalid percent value");
       return ESP_ERR_INVALID_ARG;
     }
+    if (mode_snapshot != MODBUS_MODE_AUTONOMOUS) {
+      snprintf(response, response_len,
+               "ERR windows target is available only in AUTONOMOUS mode");
+      return ESP_ERR_INVALID_STATE;
+    }
     cfg.windows_pos_b_target = percent_tenths;
-    char ok_text[48] = {0};
-    snprintf(ok_text, sizeof(ok_text), "win_b_pos=%.1f%%",
-             ((float)percent_tenths) / 10.0f);
+    modbus_write_holding_reg(MODBUS_HREG_WINDOWS_POS_B_TARGET, percent_tenths);
+    const modbus_windows_ctrl_mode_t ctrl_mode =
+        (modbus_read_holding_reg(MODBUS_HREG_WINDOWS_CTRL_MODE) ==
+         (uint16_t)MODBUS_WINDOWS_CTRL_MODE_MANUAL)
+            ? MODBUS_WINDOWS_CTRL_MODE_MANUAL
+            : MODBUS_WINDOWS_CTRL_MODE_AUTO;
+    char ok_text[80] = {0};
+    snprintf(ok_text, sizeof(ok_text),
+             "win_b_pos=%.1f%% requested=%.1f%% mode=%s",
+             ((float)percent_tenths) / 10.0f,
+             ((float)percent_tenths) / 10.0f,
+             windows_ctrl_mode_to_string(ctrl_mode));
     return apply_ascii_autonomous_update(&cfg, response, response_len, ok_text);
   }
 
@@ -3176,6 +3570,11 @@ static esp_err_t handle_ascii_show_command(size_t token_count, char *tokens[],
     return ESP_OK;
   }
 
+  if (token_count == 1U && strcmp(tokens[0], "windows") == 0) {
+    format_windows_summary(response, response_len);
+    return ESP_OK;
+  }
+
   if (token_count == 2U && strcmp(tokens[0], "light") == 0) {
     size_t relay_index = 0U;
     if (!parse_light_relay_ascii(tokens[1], &relay_index)) {
@@ -3264,7 +3663,6 @@ static esp_err_t handle_ascii_set_command(size_t token_count, char *tokens[],
   modbus_mode_state_t mode_snapshot = MODBUS_MODE_REMOTE;
   modbus_mode_reason_t reason_snapshot = MODBUS_REASON_NONE;
   snapshot_autonomous_state(&cfg, &mode_snapshot, &reason_snapshot);
-  (void)mode_snapshot;
   (void)reason_snapshot;
 
   if (token_count == 5U && strcmp(tokens[0], "windows") == 0 &&
@@ -3274,9 +3672,15 @@ static esp_err_t handle_ascii_set_command(size_t token_count, char *tokens[],
       snprintf(response, response_len, "ERR invalid percent value");
       return ESP_ERR_INVALID_ARG;
     }
+    if (mode_snapshot != MODBUS_MODE_AUTONOMOUS) {
+      snprintf(response, response_len,
+               "ERR windows target is available only in AUTONOMOUS mode");
+      return ESP_ERR_INVALID_STATE;
+    }
 
     if (strcmp(tokens[1], "a") == 0) {
       cfg.windows_pos_a_target = percent_tenths;
+      modbus_write_holding_reg(MODBUS_HREG_WINDOWS_POS_A_TARGET, percent_tenths);
       char ok_text[64] = {0};
       snprintf(ok_text, sizeof(ok_text), "windows a pos target=%.1f%%",
                ((float)percent_tenths) / 10.0f);
@@ -3285,6 +3689,7 @@ static esp_err_t handle_ascii_set_command(size_t token_count, char *tokens[],
     }
     if (strcmp(tokens[1], "b") == 0) {
       cfg.windows_pos_b_target = percent_tenths;
+      modbus_write_holding_reg(MODBUS_HREG_WINDOWS_POS_B_TARGET, percent_tenths);
       char ok_text[64] = {0};
       snprintf(ok_text, sizeof(ok_text), "windows b pos target=%.1f%%",
                ((float)percent_tenths) / 10.0f);
@@ -3467,10 +3872,15 @@ esp_err_t modbus_handle_ascii_command(const char *line, char *response,
 
   if (strcmp(tokens[0], "help") == 0 || strcmp(tokens[0], "?") == 0) {
     snprintf(response, response_len,
-             "OK show: autonomous mode light weather; set: win_a_pos win_b_pos "
+             "OK show: autonomous mode light weather windows; set: win_a_pos win_b_pos "
              "curt_pos sp_rail sp_grow sp_upper sp_under l1_en l1_on l1_off "
-             "l2_en l2_on l2_off light_hyst wx_temp wx_hum wx_wind wx_dir "
-             "wx_rain wx_solar wx_baro wx_dew wx_age wx_stat");
+             "l2_en l2_on l2_off light_hyst win_mode win_alg temp_open "
+             "hum_sp hum_step hum_hyst hum_open cold_close cold_hyst "
+             "windward_min windward_max "
+             "windward_thr windward_reduce leeward_min leeward_max leeward_thr "
+             "leeward_reduce wind_lag rain_mode rain_pos wx_stale_ms wx_age_max "
+             "wx_temp wx_hum wx_wind wx_dir wx_rain wx_solar wx_baro wx_dew "
+             "wx_age wx_stat");
     return ESP_OK;
   }
 
@@ -3487,26 +3897,350 @@ esp_err_t modbus_handle_ascii_command(const char *line, char *response,
   return handle_ascii_set_command(token_count, tokens, response, response_len);
 }
 
+static uint16_t modbus_read_holding_reg(uint16_t reg_index) {
+  uint16_t value = 0U;
+  if (reg_index >= MODBUS_HREG_TOTAL_COUNT) {
+    return value;
+  }
+
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    value = s_holding_regs[reg_index];
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  } else {
+    value = s_holding_regs[reg_index];
+  }
+  return value;
+}
+
+static void modbus_write_holding_reg(uint16_t reg_index, uint16_t value) {
+  if (reg_index >= MODBUS_HREG_TOTAL_COUNT) {
+    return;
+  }
+
+  if (s_mbc_slave_handler != NULL) {
+    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+    s_holding_regs[reg_index] = value;
+    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  } else {
+    s_holding_regs[reg_index] = value;
+  }
+}
+
+static float modbus_raw_percent_to_float(uint16_t raw_percent_tenths) {
+  if (raw_percent_tenths > 1000U) {
+    raw_percent_tenths = 1000U;
+  }
+  return ((float)raw_percent_tenths) / 10.0f;
+}
+
 float modbus_get_window_a_target_percent(void) {
   if (modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS) {
     uint16_t raw_target = 0U;
     taskENTER_CRITICAL(&s_state_lock);
     raw_target = s_autonomous_cfg.windows_pos_a_target;
     taskEXIT_CRITICAL(&s_state_lock);
-    return ((float)raw_target) / 10.0f;
+    return modbus_raw_percent_to_float(raw_target);
   }
 
-  uint16_t raw_target = 0;
-  if (s_mbc_slave_handler != NULL) {
-    ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
-    raw_target = s_holding_regs[MODBUS_HREG_WINDOWS_POS_A_TARGET];
-    ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_A_TARGET));
+}
+
+float modbus_get_window_b_target_percent(void) {
+  if (modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS) {
+    uint16_t raw_target = 0U;
+    taskENTER_CRITICAL(&s_state_lock);
+    raw_target = s_autonomous_cfg.windows_pos_b_target;
+    taskEXIT_CRITICAL(&s_state_lock);
+    return modbus_raw_percent_to_float(raw_target);
   }
 
-  if (raw_target > 1000U) {
-    raw_target = 1000U;
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_B_TARGET));
+}
+
+modbus_windows_ctrl_mode_t modbus_get_windows_ctrl_mode(void) {
+  const uint16_t raw_mode = modbus_read_holding_reg(MODBUS_HREG_WINDOWS_CTRL_MODE);
+  return (raw_mode == (uint16_t)MODBUS_WINDOWS_CTRL_MODE_MANUAL)
+             ? MODBUS_WINDOWS_CTRL_MODE_MANUAL
+             : MODBUS_WINDOWS_CTRL_MODE_AUTO;
+}
+
+bool modbus_get_windows_force_safe_cmd(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_WINDOWS_FORCE_SAFE_CMD) != 0U;
+}
+
+float modbus_get_windows_temp_setpoint_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_SETPOINT)) / 10.0f;
+}
+
+float modbus_get_windows_safe_min_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_SAFE_MIN_PERCENT));
+}
+
+float modbus_get_windows_wind_limit_ms(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WIND_LIMIT)) / 10.0f;
+}
+
+float modbus_get_windows_wind_storm_ms(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WIND_STORM)) / 10.0f;
+}
+
+float modbus_get_windows_wind_recover_ms(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WIND_RECOVER)) / 10.0f;
+}
+
+uint16_t modbus_get_window_a_azimuth_deg(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_WINDOW_A_AZIMUTH_DEG);
+  return (uint16_t)(raw % 360U);
+}
+
+uint16_t modbus_get_windows_wind_sector_half_width_deg(void) {
+  uint16_t raw =
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WIND_SECTOR_HALF_WIDTH_DEG);
+  if (raw > 180U) {
+    raw = 180U;
   }
-  return ((float)raw_target) / 10.0f;
+  return raw;
+}
+
+float modbus_get_windows_temp_step_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_STEP_C)) / 10.0f;
+}
+
+float modbus_get_windows_temp_step_hysteresis_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_STEP_HYST_C)) /
+         10.0f;
+}
+
+float modbus_get_windows_temp_step_target_increment_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_STEP_TARGET_PERCENT));
+}
+
+uint16_t modbus_get_windows_temp_step_max_index(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_STEP_MAX_INDEX);
+}
+
+modbus_windows_auto_algo_mode_t modbus_get_windows_auto_algo_mode(void) {
+  const uint16_t raw =
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_AUTO_ALGO_MODE);
+  return (raw == (uint16_t)MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY)
+             ? MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY
+             : MODBUS_WINDOWS_AUTO_ALGO_TEMP;
+}
+
+float modbus_get_windows_humidity_setpoint_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_HUM_SETPOINT));
+}
+
+float modbus_get_windows_humidity_step_percent(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_HUM_STEP)) / 10.0f;
+}
+
+float modbus_get_windows_humidity_step_hysteresis_percent(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_HUM_STEP_HYST)) /
+         10.0f;
+}
+
+float modbus_get_windows_humidity_step_target_increment_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_HUM_STEP_TARGET_PERCENT));
+}
+
+uint16_t modbus_get_windows_humidity_step_max_index(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_WINDOWS_HUM_STEP_MAX_INDEX);
+}
+
+float modbus_get_windows_cold_close_delta_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_COLD_CLOSE_DELTA)) /
+         10.0f;
+}
+
+float modbus_get_windows_cold_close_hysteresis_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_COLD_CLOSE_HYST)) /
+         10.0f;
+}
+
+float modbus_get_windows_windward_min_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WINDWARD_MIN_PERCENT));
+}
+
+float modbus_get_windows_windward_max_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WINDWARD_MAX_PERCENT));
+}
+
+float modbus_get_windows_windward_speed_threshold_ms(void) {
+  return ((float)modbus_read_holding_reg(
+              MODBUS_HREG_WINDOWS_WINDWARD_SPEED_THRESHOLD)) /
+         10.0f;
+}
+
+float modbus_get_windows_windward_reduction_percent_per_ms(void) {
+  return ((float)modbus_read_holding_reg(
+              MODBUS_HREG_WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS)) /
+         10.0f;
+}
+
+float modbus_get_windows_leeward_min_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_LEEWARD_MIN_PERCENT));
+}
+
+float modbus_get_windows_leeward_max_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_LEEWARD_MAX_PERCENT));
+}
+
+float modbus_get_windows_leeward_speed_threshold_ms(void) {
+  return ((float)modbus_read_holding_reg(
+              MODBUS_HREG_WINDOWS_LEEWARD_SPEED_THRESHOLD)) /
+         10.0f;
+}
+
+float modbus_get_windows_leeward_reduction_percent_per_ms(void) {
+  return ((float)modbus_read_holding_reg(
+              MODBUS_HREG_WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS)) /
+         10.0f;
+}
+
+float modbus_get_windows_windward_lag_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WINDWARD_LAG_PERCENT));
+}
+
+modbus_windows_rain_mode_t modbus_get_windows_rain_mode(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_WINDOWS_RAIN_MODE);
+  return (raw == (uint16_t)MODBUS_WINDOWS_RAIN_MODE_WINDWARD)
+             ? MODBUS_WINDOWS_RAIN_MODE_WINDWARD
+             : MODBUS_WINDOWS_RAIN_MODE_DISABLED;
+}
+
+float modbus_get_windows_rain_windward_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_RAIN_WINDWARD_PERCENT));
+}
+
+modbus_windows_weather_stale_policy_t
+modbus_get_windows_weather_stale_policy(void) {
+  const uint16_t raw =
+      modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WEATHER_STALE_POLICY);
+  return (raw == (uint16_t)MODBUS_WINDOWS_WEATHER_STALE_IGNORE)
+             ? MODBUS_WINDOWS_WEATHER_STALE_IGNORE
+             : MODBUS_WINDOWS_WEATHER_STALE_CLOSE_SAFE;
+}
+
+uint32_t modbus_get_windows_weather_stale_timeout_ms(void) {
+  return (uint32_t)modbus_read_holding_reg(
+      MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS);
+}
+
+uint16_t modbus_get_windows_weather_source_age_limit_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S);
+}
+
+float modbus_get_rll400_target_hysteresis_percent(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_RLL400_TARGET_HYST_PERCENT)) /
+         10.0f;
+}
+
+float modbus_get_rll400_motion_delta_percent(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_RLL400_MOTION_DELTA_PERCENT)) /
+         10.0f;
+}
+
+uint32_t modbus_get_rll400_no_motion_timeout_ms(void) {
+  return (uint32_t)modbus_read_holding_reg(MODBUS_HREG_RLL400_NO_MOTION_TIMEOUT_MS);
+}
+
+uint16_t modbus_get_window_fault_reset_token(modbus_window_channel_t channel) {
+  return modbus_read_holding_reg((channel == MODBUS_WINDOW_CHANNEL_B)
+                                     ? MODBUS_HREG_WINDOW_B_FAULT_RESET_TOKEN
+                                     : MODBUS_HREG_WINDOW_A_FAULT_RESET_TOKEN);
+}
+
+void modbus_get_weather_runtime(modbus_weather_runtime_t *out_runtime) {
+  if (out_runtime == NULL) {
+    return;
+  }
+
+  weather_snapshot_t snapshot = {0};
+  uint32_t last_rx_ms = 0U;
+  bool valid = false;
+  bool stale = true;
+
+  taskENTER_CRITICAL(&s_state_lock);
+  snapshot = s_weather_active_snapshot;
+  last_rx_ms = s_weather_last_rx_ms;
+  valid = s_weather_valid;
+  stale = s_weather_stale;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  memset(out_runtime, 0, sizeof(*out_runtime));
+  out_runtime->wind_speed_ms = ((float)snapshot.wind_speed) / 10.0f;
+  out_runtime->wind_dir_deg = (uint16_t)(snapshot.wind_dir % 360U);
+  out_runtime->source_age_s = snapshot.source_age_s;
+  out_runtime->status_bits = snapshot.status_bits;
+  out_runtime->valid = valid;
+  out_runtime->stale = stale;
+  out_runtime->rain_active = (snapshot.rain_flag != 0U);
+  if (valid && last_rx_ms != 0U) {
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    out_runtime->rx_age_ms = now_ms - last_rx_ms;
+  }
+}
+
+void modbus_set_windows_runtime(uint16_t windows_status_bits,
+                                uint16_t window_a_status_bits,
+                                uint16_t window_b_status_bits,
+                                uint16_t window_a_fault_code,
+                                uint16_t window_b_fault_code,
+                                uint16_t air_temp_sensor_status,
+                                uint16_t window_a_local_manual_active,
+                                uint16_t window_b_local_manual_active) {
+  modbus_write_holding_reg(MODBUS_HREG_WINDOWS_STATUS_BITS, windows_status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOW_A_STATUS_BITS,
+                           window_a_status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOW_B_STATUS_BITS,
+                           window_b_status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOW_A_FAULT_CODE,
+                           window_a_fault_code);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOW_B_FAULT_CODE,
+                           window_b_fault_code);
+  modbus_write_holding_reg(MODBUS_HREG_AIR_TEMP_SENSOR_STATUS,
+                           air_temp_sensor_status);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOW_A_LOCAL_MANUAL_ACTIVE,
+                           window_a_local_manual_active);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOW_B_LOCAL_MANUAL_ACTIVE,
+                           window_b_local_manual_active);
+}
+
+void modbus_set_windows_target_diagnostics(
+    float base_target_a_percent, float base_target_b_percent,
+    float effective_target_a_percent, float effective_target_b_percent,
+    uint16_t active_protection_bits,
+    modbus_windows_windward_side_t windward_side) {
+  modbus_write_holding_reg(
+      MODBUS_HREG_WINDOWS_BASE_TARGET_A,
+      float_to_u16_tenths(base_target_a_percent, 0.0f, 100.0f));
+  modbus_write_holding_reg(
+      MODBUS_HREG_WINDOWS_BASE_TARGET_B,
+      float_to_u16_tenths(base_target_b_percent, 0.0f, 100.0f));
+  modbus_write_holding_reg(
+      MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_A,
+      float_to_u16_tenths(effective_target_a_percent, 0.0f, 100.0f));
+  modbus_write_holding_reg(
+      MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_B,
+      float_to_u16_tenths(effective_target_b_percent, 0.0f, 100.0f));
+  modbus_write_holding_reg(MODBUS_HREG_WINDOWS_ACTIVE_PROTECTION_BITS,
+                           active_protection_bits);
+  modbus_write_holding_reg(MODBUS_HREG_WINDOWS_WINDWARD_SIDE,
+                           (uint16_t)windward_side);
 }
 
 static uint16_t modbus_get_autonomous_water_setpoint_raw(
