@@ -1,6 +1,6 @@
 #pragma once
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include <stdint.h>
 
@@ -11,7 +11,7 @@ extern "C" {
 #define DS3231_I2C_ADDR 0x68
 
 typedef struct {
-  i2c_port_t i2c_port;
+  i2c_master_bus_handle_t i2c_bus;
   uint8_t i2c_addr;
 } ds3231_config_t;
 

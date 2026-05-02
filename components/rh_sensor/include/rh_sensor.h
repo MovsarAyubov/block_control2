@@ -1,6 +1,6 @@
 #pragma once
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -14,7 +14,7 @@ extern "C" {
  * @brief Configuration for RH Sensor (ADS1115)
  */
 typedef struct {
-  i2c_port_t i2c_port; /*!< I2C Port Number */
+  i2c_master_bus_handle_t i2c_bus; /*!< I2C master bus handle */
   uint8_t i2c_addr;    /*!< ADS1115 Address (e.g. 0x48) */
   float r1_ohm;        /*!< Upper divider resistor */
   float r2_ohm;        /*!< Lower divider resistor */

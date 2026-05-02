@@ -1,3 +1,3 @@
 idf_component_register(SRCS "rh_sensor.c"
                        INCLUDE_DIRS "include"
-                       REQUIRES driver ads1115)
+                       REQUIRES esp_driver_i2c ads1115)

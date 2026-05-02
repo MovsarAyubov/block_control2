@@ -1,6 +1,6 @@
 #pragma once
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -14,7 +14,7 @@ extern "C" {
 #define ADS1115_ADDR_SCL 0x4B
 
 typedef struct ads1115_config_t {
-  i2c_port_t i2c_port;
+  i2c_master_bus_handle_t i2c_bus;
   uint8_t i2c_addr;
 } ads1115_config_t;
 

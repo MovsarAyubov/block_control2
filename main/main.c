@@ -1,5 +1,5 @@
-#include "driver/i2c.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "ds3231.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -23,8 +23,6 @@ static const char *TAG = "APP";
 #define I2C_MASTER_SDA_IO 21
 #define I2C_MASTER_NUM 0
 #define I2C_MASTER_FREQ_HZ 100000
-#define I2C_MASTER_TX_BUF_DISABLE 0
-#define I2C_MASTER_RX_BUF_DISABLE 0
 
 // Sensor Config
 #define R1 5220.0f
@@ -69,6 +67,7 @@ static max31865_handle_t max_handle = NULL;
 static max31865_handle_t max_handle2 = NULL;
 static valve_3way_handle_t valve_handle = NULL;
 static ds3231_handle_t rtc_handle = NULL;
+static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static bool s_rtc_available = false;
 
 static volatile float s_pos_pct = 0.0f;
@@ -109,19 +108,15 @@ static bool modbus_rtc_set_time_cb(uint8_t hour, uint8_t minute,
 }
 
 static esp_err_t i2c_master_init(void) {
-  int i2c_master_port = I2C_MASTER_NUM;
-  i2c_config_t conf = {
-      .mode = I2C_MODE_MASTER,
+  i2c_master_bus_config_t conf = {
+      .i2c_port = I2C_MASTER_NUM,
       .sda_io_num = I2C_MASTER_SDA_IO,
       .scl_io_num = I2C_MASTER_SCL_IO,
-      .sda_pullup_en = GPIO_PULLUP_ENABLE,
-      .scl_pullup_en = GPIO_PULLUP_ENABLE,
-      .master.clk_speed = I2C_MASTER_FREQ_HZ,
+      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .glitch_ignore_cnt = 7,
+      .flags.enable_internal_pullup = true,
   };
-  i2c_param_config(i2c_master_port, &conf);
-  return i2c_driver_install(i2c_master_port, conf.mode,
-                            I2C_MASTER_RX_BUF_DISABLE,
-                            I2C_MASTER_TX_BUF_DISABLE, 0);
+  return i2c_new_master_bus(&conf, &i2c_bus_handle);
 }
 
 static void light_relay_init(void) {
@@ -261,7 +256,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(i2c_master_init());
   ESP_LOGI(TAG, "I2C initialized");
 
-  ds3231_config_t rtc_cfg = {.i2c_port = I2C_MASTER_NUM, .i2c_addr = DS3231_I2C_ADDR};
+  ds3231_config_t rtc_cfg = {.i2c_bus = i2c_bus_handle, .i2c_addr = DS3231_I2C_ADDR};
   esp_err_t rtc_err = ds3231_init(&rtc_cfg, &rtc_handle);
   if (rtc_err == ESP_OK) {
     s_rtc_available = true;
@@ -297,7 +292,7 @@ void app_main(void) {
   modbus_bind_rtc_callbacks(modbus_rtc_get_time_cb, modbus_rtc_set_time_cb,
                             NULL);
 
-  rh_sensor_config_t rh_cfg = {.i2c_port = I2C_MASTER_NUM,
+  rh_sensor_config_t rh_cfg = {.i2c_bus = i2c_bus_handle,
                                .i2c_addr = ADS1115_ADDR_GND,
                                .r1_ohm = R1,
                                .r2_ohm = R2,
@@ -305,7 +300,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(rh_sensor_init(&rh_cfg, &rh_handle));
   ESP_LOGI(TAG, "RH sensor initialized");
 
-  rll400_config_t rll_cfg = {.i2c_port = I2C_MASTER_NUM,
+  rll400_config_t rll_cfg = {.i2c_bus = i2c_bus_handle,
                              .ads_addr = ADS1115_ADDR_GND,
                              .shunt_resistor_ohm = RLL_SHUNT_OHM,
                              .pin_open = RLL_PIN_OPEN,

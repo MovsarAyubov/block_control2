@@ -10,7 +10,7 @@ extern "C" {
 
 typedef struct {
   // I2C / ADS1115 definition
-  i2c_port_t i2c_port;
+  i2c_master_bus_handle_t i2c_bus;
   uint8_t ads_addr;
   // ads_channel removed as we use hardcoded differential pair A2-A3
   float shunt_resistor_ohm; // Resistor value (e.g., 109.3)

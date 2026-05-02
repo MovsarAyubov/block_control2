@@ -35,7 +35,7 @@ esp_err_t rh_sensor_init(const rh_sensor_config_t *config,
 
   // Initialize ADS1115 driver
   ads1115_config_t ads_cfg = {
-      .i2c_port = config->i2c_port,
+      .i2c_bus = config->i2c_bus,
       .i2c_addr = config->i2c_addr,
   };
 

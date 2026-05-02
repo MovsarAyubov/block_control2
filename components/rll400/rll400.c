@@ -41,7 +41,7 @@ esp_err_t rll400_init(const rll400_config_t *config,
   gpio_set_level(config->pin_close, 0);
 
   // Init ADS1115
-  ads1115_config_t ads_cfg = {.i2c_port = config->i2c_port,
+  ads1115_config_t ads_cfg = {.i2c_bus = config->i2c_bus,
                               .i2c_addr = config->ads_addr};
   esp_err_t err = ads1115_init(&ads_cfg, &ctx->ads_handle);
   if (err != ESP_OK) {
