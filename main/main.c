@@ -1,5 +1,6 @@
 #include "driver/i2c.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "ds3231.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -13,8 +14,12 @@
 #include "rh_sensor.h"
 #include "rll400.h"
 #include "valve_3way.h"
+#include "sdkconfig.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static const char *TAG = "APP";
 
@@ -61,6 +66,10 @@ static const char *TAG = "APP";
 #define RTC_INIT_HOUR 10
 #define RTC_INIT_MINUTE 31
 #define RTC_INIT_SECOND 0
+#define USB_BRIDGE_UART UART_NUM_0
+#define USB_BRIDGE_BAUD 115200
+#define USB_BRIDGE_LINE_MAX 192
+#define USB_BRIDGE_REG_MAX 64
 
 // Static Handles
 static rh_sensor_handle_t rh_handle = NULL;
@@ -73,6 +82,146 @@ static bool s_rtc_available = false;
 
 static volatile float s_pos_pct = 0.0f;
 static volatile float s_current_ma = 0.0f;
+
+#if CONFIG_GREENHOUSE_USB_BRIDGE
+static void usb_bridge_write(const char *text) {
+  if (text != NULL) {
+    (void)uart_write_bytes(USB_BRIDGE_UART, text, strlen(text));
+  }
+}
+
+static void usb_bridge_handle_line(char *line) {
+  char *save = NULL;
+  char *cmd = strtok_r(line, " \t\r\n", &save);
+  if (cmd == NULL || strcmp(cmd, "GH") != 0) {
+    return;
+  }
+
+  char *op = strtok_r(NULL, " \t\r\n", &save);
+  if (op == NULL) {
+    usb_bridge_write("GH ERR missing-op\n");
+    return;
+  }
+
+  if (strcmp(op, "PING") == 0) {
+    usb_bridge_write("GH OK PONG\n");
+    return;
+  }
+
+  if (strcmp(op, "READ") == 0) {
+    char *start_s = strtok_r(NULL, " \t\r\n", &save);
+    char *count_s = strtok_r(NULL, " \t\r\n", &save);
+    if (start_s == NULL || count_s == NULL) {
+      usb_bridge_write("GH ERR read-args\n");
+      return;
+    }
+    uint16_t start = (uint16_t)strtoul(start_s, NULL, 0);
+    uint16_t count = (uint16_t)strtoul(count_s, NULL, 0);
+    if (count == 0U || count > USB_BRIDGE_REG_MAX) {
+      usb_bridge_write("GH ERR read-count\n");
+      return;
+    }
+    uint16_t regs[USB_BRIDGE_REG_MAX] = {0};
+    if (!modbus_read_holding_regs(start, count, regs)) {
+      usb_bridge_write("GH ERR read-range\n");
+      return;
+    }
+    char out[USB_BRIDGE_LINE_MAX] = {0};
+    int used = snprintf(out, sizeof(out), "GH DATA %u %u", (unsigned)start,
+                        (unsigned)count);
+    for (uint16_t i = 0; i < count && used > 0 && used < (int)sizeof(out); ++i) {
+      used += snprintf(out + used, sizeof(out) - (size_t)used, " %u",
+                       (unsigned)regs[i]);
+    }
+    if (used > 0 && used < (int)sizeof(out)) {
+      snprintf(out + used, sizeof(out) - (size_t)used, "\n");
+    } else {
+      out[sizeof(out) - 2U] = '\n';
+      out[sizeof(out) - 1U] = '\0';
+    }
+    usb_bridge_write(out);
+    return;
+  }
+
+  if (strcmp(op, "WRITE") == 0) {
+    char *start_s = strtok_r(NULL, " \t\r\n", &save);
+    if (start_s == NULL) {
+      usb_bridge_write("GH ERR write-args\n");
+      return;
+    }
+    uint16_t start = (uint16_t)strtoul(start_s, NULL, 0);
+    uint16_t values[USB_BRIDGE_REG_MAX] = {0};
+    uint16_t count = 0;
+    char *value_s = NULL;
+    while ((value_s = strtok_r(NULL, " \t\r\n", &save)) != NULL &&
+           count < USB_BRIDGE_REG_MAX) {
+      values[count++] = (uint16_t)strtoul(value_s, NULL, 0);
+    }
+    if (count == 0U) {
+      usb_bridge_write("GH ERR write-count\n");
+      return;
+    }
+    if (!modbus_write_holding_regs(start, values, count)) {
+      usb_bridge_write("GH ERR write-range\n");
+      return;
+    }
+    char out[64] = {0};
+    snprintf(out, sizeof(out), "GH OK WRITE %u\n", (unsigned)count);
+    usb_bridge_write(out);
+    return;
+  }
+
+  usb_bridge_write("GH ERR unknown-op\n");
+}
+
+static void usb_bridge_task(void *arg) {
+  (void)arg;
+  uart_config_t cfg = {
+      .baud_rate = USB_BRIDGE_BAUD,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT,
+  };
+  (void)uart_param_config(USB_BRIDGE_UART, &cfg);
+  esp_err_t install_err =
+      uart_driver_install(USB_BRIDGE_UART, 2048, 2048, 0, NULL, 0);
+  if (install_err != ESP_OK && install_err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "USB bridge UART install failed: %s",
+             esp_err_to_name(install_err));
+    vTaskDelete(NULL);
+    return;
+  }
+
+  ESP_LOGI(TAG, "USB bridge enabled on UART0 (%u baud)", USB_BRIDGE_BAUD);
+  usb_bridge_write("GH READY block_control2 usb-bridge\n");
+
+  char line[USB_BRIDGE_LINE_MAX] = {0};
+  size_t len = 0;
+  uint8_t byte = 0;
+  while (1) {
+    int got = uart_read_bytes(USB_BRIDGE_UART, &byte, 1, pdMS_TO_TICKS(100));
+    if (got <= 0) {
+      continue;
+    }
+    if (byte == '\n' || byte == '\r') {
+      if (len > 0) {
+        line[len] = '\0';
+        usb_bridge_handle_line(line);
+        len = 0;
+      }
+      continue;
+    }
+    if (len + 1 < sizeof(line)) {
+      line[len++] = (char)byte;
+    } else {
+      len = 0;
+      usb_bridge_write("GH ERR line-too-long\n");
+    }
+  }
+}
+#endif
 
 static bool modbus_rtc_get_time_cb(uint8_t *hour, uint8_t *minute,
                                    uint8_t *second, void *ctx) {
@@ -164,14 +313,18 @@ static void control_task(void *arg) {
   }
 }
 
+static bool is_plausible_process_temp(float value) {
+  return value >= -40.0f && value <= 120.0f;
+}
+
 static void worker_task(void *arg) {
   (void)arg;
   ESP_LOGI(TAG, "Worker task started (5s)");
   TickType_t last_wake = xTaskGetTickCount();
 
   float rh = 0.0f;
-  float temp_air = 0.0f;
-  float temp_water_rail = 0.0f;
+  float temp_air = 22.0f;
+  float temp_water_rail = 24.0f;
 
   while (1) {
     // Time source for light schedule: DS3231 when available, otherwise uptime fallback.
@@ -204,17 +357,26 @@ static void worker_task(void *arg) {
       ESP_LOGE(TAG, "Failed to read RH sensor");
     }
 
-    if (max31865_read_temp(max_handle, &temp_air) == ESP_OK) {
+    float read_temp_air = 0.0f;
+    if (max31865_read_temp(max_handle, &read_temp_air) == ESP_OK &&
+        is_plausible_process_temp(read_temp_air)) {
+      temp_air = read_temp_air;
       ESP_LOGI(TAG, "PT500 (1) Temp: %.2f C", temp_air);
       (void)valve_3way_process(valve_handle, temp_air);
     } else {
-      ESP_LOGE(TAG, "Failed to read PT500 (1)");
+      ESP_LOGE(TAG, "Invalid PT500 (1) read, keeping last air temp: %.2f C",
+               temp_air);
     }
 
-    if (max31865_read_temp(max_handle2, &temp_water_rail) == ESP_OK) {
+    float read_temp_water_rail = 0.0f;
+    if (max31865_read_temp(max_handle2, &read_temp_water_rail) == ESP_OK &&
+        is_plausible_process_temp(read_temp_water_rail)) {
+      temp_water_rail = read_temp_water_rail;
       ESP_LOGI(TAG, "PT500 (2) Temp: %.2f C", temp_water_rail);
     } else {
-      ESP_LOGE(TAG, "Failed to read PT500 (2)");
+      ESP_LOGE(TAG,
+               "Invalid PT500 (2) read, keeping last water rail temp: %.2f C",
+               temp_water_rail);
     }
 
     float pos = s_pos_pct;
@@ -246,8 +408,53 @@ static void worker_task(void *arg) {
   }
 }
 
+#if CONFIG_GREENHOUSE_DEVICE_MODE_SIMULATED
+static void simulated_control_task(void *arg) {
+  (void)arg;
+  ESP_LOGI(TAG, "Simulated control task started");
+
+  while (1) {
+    bool relay1_on = false;
+    bool relay2_on = false;
+    modbus_get_light_relay_state(&relay1_on, &relay2_on);
+    ESP_LOGI(TAG, "SIM light relays -> relay1=%u relay2=%u",
+             relay1_on ? 1U : 0U, relay2_on ? 1U : 0U);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+static void simulated_worker_task(void *arg) {
+  (void)arg;
+  ESP_LOGI(TAG, "Simulated worker task started");
+
+  while (1) {
+    uint32_t sec = (uint32_t)((esp_timer_get_time() / 1000000ULL) % 86400ULL);
+    uint8_t hour = (uint8_t)((sec / 3600U) % 24U);
+    uint8_t minute = (uint8_t)((sec % 3600U) / 60U);
+    uint8_t second = (uint8_t)(sec % 60U);
+    modbus_set_light_current_time(hour, minute, second);
+
+    float t = (float)(esp_timer_get_time() / 1000000ULL);
+    float temp_air = 22.0f + sinf(t / 60.0f) * 2.0f;
+    float rh = 60.0f + cosf(t / 45.0f) * 8.0f;
+    float water = 24.0f + sinf(t / 50.0f) * 1.5f;
+    float pos = 20.0f + sinf(t / 80.0f) * 15.0f;
+
+    modbus_set_telemetry(temp_air, rh, water, water - 0.5f, water - 1.0f,
+                         water + 2.0f, pos, pos * 0.9f, 0.0f);
+    modbus_set_solar_radiation(320.0f + sinf(t / 30.0f) * 180.0f);
+
+    ESP_LOGI(TAG, "SIM telemetry -> air=%.1fC rh=%.1f%% water=%.1fC pos=%.1f%%",
+             temp_air, rh, water, pos);
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_LOOP_MS));
+  }
+}
+#endif
+
 void app_main(void) {
+#if CONFIG_GREENHOUSE_DEVICE_MODE_PHYSICAL
   light_relay_init();
+#endif
 
   esp_err_t nvs_err = nvs_flash_init();
   if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -257,6 +464,17 @@ void app_main(void) {
   ESP_ERROR_CHECK(nvs_err);
 
   modbus_init();
+#if CONFIG_GREENHOUSE_USB_BRIDGE
+  xTaskCreate(usb_bridge_task, "usb_bridge", 4096, NULL, 7, NULL);
+#endif
+
+#if CONFIG_GREENHOUSE_DEVICE_MODE_SIMULATED
+  ESP_LOGW(TAG, "Greenhouse device mode: SIMULATED");
+  xTaskCreate(simulated_control_task, "sim_ctrl", 4096, NULL, 6, NULL);
+  xTaskCreate(simulated_worker_task, "sim_worker", 4096, NULL, 5, NULL);
+  return;
+#else
+  ESP_LOGI(TAG, "Greenhouse device mode: PHYSICAL");
 
   ESP_ERROR_CHECK(i2c_master_init());
   ESP_LOGI(TAG, "I2C initialized");
@@ -344,4 +562,5 @@ void app_main(void) {
 
   xTaskCreate(control_task, "ctrl", 4096, NULL, 6, NULL);
   xTaskCreate(worker_task, "worker", 8192, NULL, 5, NULL);
+#endif
 }

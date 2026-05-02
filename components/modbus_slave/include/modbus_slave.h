@@ -123,6 +123,10 @@ void modbus_set_solar_radiation(float radiation);
 float modbus_get_window_a_target_percent(void);
 modbus_mode_state_t modbus_get_mode_state(void);
 bool modbus_is_autonomous(void);
+bool modbus_read_holding_regs(uint16_t start_reg, uint16_t count,
+                              uint16_t *out_regs);
+bool modbus_write_holding_regs(uint16_t start_reg, const uint16_t *values,
+                               uint16_t count);
 
 #ifdef __cplusplus
 }

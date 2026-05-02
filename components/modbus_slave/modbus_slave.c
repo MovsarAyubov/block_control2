@@ -1137,3 +1137,37 @@ modbus_mode_state_t modbus_get_mode_state(void) {
 bool modbus_is_autonomous(void) {
   return modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS;
 }
+
+bool modbus_read_holding_regs(uint16_t start_reg, uint16_t count,
+                              uint16_t *out_regs) {
+  if (s_mbc_slave_handler == NULL || out_regs == NULL || count == 0U ||
+      start_reg >= MODBUS_HREG_TOTAL_COUNT ||
+      (uint32_t)start_reg + (uint32_t)count > MODBUS_HREG_TOTAL_COUNT) {
+    return false;
+  }
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  for (uint16_t i = 0; i < count; ++i) {
+    out_regs[i] = s_holding_regs[start_reg + i];
+  }
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  return true;
+}
+
+bool modbus_write_holding_regs(uint16_t start_reg, const uint16_t *values,
+                               uint16_t count) {
+  if (s_mbc_slave_handler == NULL || values == NULL || count == 0U ||
+      start_reg >= MODBUS_HREG_TOTAL_COUNT ||
+      (uint32_t)start_reg + (uint32_t)count > MODBUS_HREG_TOTAL_COUNT) {
+    return false;
+  }
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  for (uint16_t i = 0; i < count; ++i) {
+    s_holding_regs[start_reg + i] = values[i];
+  }
+  update_master_seen_and_streak(true);
+  update_diag_regs_locked();
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+  return true;
+}

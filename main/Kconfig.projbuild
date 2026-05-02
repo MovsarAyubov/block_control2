@@ -1,0 +1,26 @@
+menu "Greenhouse block controller"
+
+choice GREENHOUSE_DEVICE_MODE
+    prompt "Device mode"
+    default GREENHOUSE_DEVICE_MODE_PHYSICAL
+    help
+        Physical mode reads real sensors and drives real GPIO outputs.
+        Simulated mode generates synthetic telemetry and does not require the
+        sensor/actuator hardware to be connected.
+
+    config GREENHOUSE_DEVICE_MODE_PHYSICAL
+        bool "Physical hardware"
+
+    config GREENHOUSE_DEVICE_MODE_SIMULATED
+        bool "Simulated hardware"
+endchoice
+
+config GREENHOUSE_USB_BRIDGE
+    bool "Enable USB serial bridge"
+    default y
+    help
+        Enables a simple line protocol on the ESP32 USB serial console so the
+        PC host runtime can read/write the same holding registers without the
+        STM32 or an RS485 adapter.
+
+endmenu
