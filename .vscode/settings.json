@@ -2,5 +2,12 @@
   "C_Cpp.intelliSenseEngine": "default",
   "idf.portWin": "COM4",
   "idf.flashType": "UART",
-  "idf.currentSetup": "C:\\Users\\AUTcomp\\esp\\v5.5.2\\esp-idf"
+  "idf.currentSetup": "C:\\esp-new\\.espressif\\v6.0\\esp-idf",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=d:\\Workspace\\ogurcy\\block_control2\\build"
+  ],
+  "idf.customExtraVars": {}
 }
