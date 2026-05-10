@@ -69,11 +69,23 @@
 - ESP32 `GPIO2` -> `74HC595 SER/DS`
 - ESP32 `GPIO4` -> `74HC595 SHCP/SRCLK`
 - ESP32 `GPIO18` -> `74HC595 STCP/RCLK`
-- `Q0` -> Light relay 1
-- `Q1` -> Light relay 2
-- `Q2` -> 3-way valve `OPEN`
-- `Q3` -> 3-way valve `CLOSE`
-- Current implementation uses `74HC595` for the two light relays and one `3-way valve`
+- The output latch is a cascade of three `74HC595` chips, `24` logical bits.
+- `bit0` -> Light relay 1
+- `bit1` -> Light relay 2
+- `bit2` -> Rail 3-way valve `OPEN`
+- `bit3` -> Rail 3-way valve `CLOSE`
+- `bit4` -> Upper 3-way valve `OPEN`
+- `bit5` -> Upper 3-way valve `CLOSE`
+- `bit6` -> Undertray 3-way valve `OPEN`
+- `bit7` -> Undertray 3-way valve `CLOSE`
+- `bit8` -> Grow pipe 3-way valve `OPEN`
+- `bit9` -> Grow pipe 3-way valve `CLOSE`
+- `bit10` -> Rail pump contactor
+- `bit11` -> Upper pump contactor
+- `bit12` -> Undertray pump contactor
+- `bit13` -> Grow pipe pump contactor
+- `bit14..23` -> reserved
+- Valve outputs have an interlock: `OPEN` and `CLOSE` for the same valve are never driven together.
 
 ### Bluetooth ASCII aliases for autonomous setpoints
 - Required: `103..109`, `111..112`, `117..118`, `122`
@@ -195,7 +207,8 @@
 - `179` WINDOWS_WIND_SECTOR_HALF_WIDTH_DEG
 - `180` WINDOWS_TEMP_STEP_C, `x10 C`
 - `181` WINDOWS_TEMP_STEP_HYST_C, `x10 C`
-- `182` RLL400_TARGET_HYST_PERCENT, `x10 %`
+- `182` RLL400_TARGET_HYST_PERCENT, `x10 %`; also stabilizes small
+  effective-target changes before they are sent to RLL400
 - `183` RLL400_MOTION_DELTA_PERCENT, `x10 %`
 - `184` RLL400_NO_MOTION_TIMEOUT_MS
 - `185` WINDOW_A_FAULT_RESET_TOKEN
@@ -236,8 +249,75 @@
 - `220` WINDOWS_TEMP_STEP_MAX_INDEX, legacy/reserved
 - `221` WINDOWS_HUM_STEP_TARGET_PERCENT, `x10 %`
 - `222` WINDOWS_HUM_STEP_MAX_INDEX, legacy/reserved
+
+Wind reduction uses the normal formula
+`dynamic_max = max_percent - (wind_speed - threshold) * reduction`, but the wind
+speed used by that formula is held until the measured wind changes by at least
+`0.5 m/s`. This gives two target recalculations per `1 m/s` instead of reacting
+to every `0.1 m/s` update from the weather station.
 - `223` WINDOWS_WEATHER_STALE_TIMEOUT_MS
 - `224` WINDOWS_WEATHER_SOURCE_AGE_S
+
+## Heating Control, `225..242`
+- `225` HEATING_CTRL_MODE: `0=AUTO`, `1=OFF`, `2=MANUAL`
+- `226` HEATING_AIR_SETPOINT, `x10 C`, default `20.0 C`
+- `227` HEATING_AIR_HYST, `x10 C`, default `0.5 C`
+- `228` HEATING_STAGE_DELTA_1, `x10 C`, default `0.3 C`
+- `229` HEATING_STAGE_DELTA_2, `x10 C`, default `1.0 C`
+- `230` HEATING_STAGE_DELTA_3, `x10 C`, default `2.0 C`
+- `231` HEATING_STAGE_DELTA_4, `x10 C`, default `3.0 C`
+- `232` HEATING_MIN_ON_S, default `60 s`
+- `233` HEATING_MIN_OFF_S, default `30 s`
+- `234` HEATING_MANUAL_PUMP_MASK`
+- `235` HEATING_MANUAL_VALVE_OPEN_MASK`
+- `236` HEATING_MANUAL_VALVE_CLOSE_MASK`
+- `237` HEATING_STATUS_BITS, RO
+- `238` HEATING_ACTIVE_STAGE, RO
+- `239` HEATING_PUMP_MASK, RO
+- `240` HEATING_VALVE_OPEN_MASK, RO
+- `241` HEATING_VALVE_CLOSE_MASK, RO
+- `242` HEATING_SENSOR_STATUS_BITS, RO
+
+### Heating Algorithm
+- In `AUTO`, heating stages are selected by air temperature deficit:
+  `HEATING_AIR_SETPOINT - AIR_TEMP`.
+- Stage order: `rail -> upper -> undertray -> grow`.
+- Stage masks:
+  - stage `0`: all contours off
+  - stage `1`: `rail`
+  - stage `2`: `rail + upper`
+  - stage `3`: `rail + upper + undertray`
+  - stage `4`: `rail + upper + undertray + grow`
+- If the air temperature sensor is invalid, all pumps are disabled and valves go to fail-safe close/stop.
+- Each active contour enables its pump only when its water sensor is valid.
+- Active contour valve control:
+  - `actual_water > setpoint + hysteresis` -> `CLOSE`
+  - `actual_water < setpoint - hysteresis` -> `OPEN`
+  - inside the hysteresis band -> `STOP`
+- Inactive or water-fault contours turn the pump off and close the valve for a limited safe-close window, then stop the valve output.
+- In `MANUAL`, masks `234..236` directly request pump/open/close outputs; close requests are ignored where the same contour also has an open request.
+
+### Heating Masks
+- `bit0` -> rail
+- `bit1` -> upper
+- `bit2` -> undertray
+- `bit3` -> grow
+
+### Heating Status Bits (`237`)
+- `bit0` heating enabled, at least one pump active
+- `bit1` manual mode active
+- `bit2` off mode active
+- `bit3` air temperature sensor fault
+- `bit4` at least one water temperature sensor fault
+- `bit5` min-on hold active
+- `bit6` min-off hold active
+
+### Heating Sensor Status Bits (`242`)
+- `bit0` air temperature fault
+- `bit1` rail water temperature fault
+- `bit2` upper water temperature fault
+- `bit3` undertray water temperature fault
+- `bit4` grow water temperature fault
 
 ### Window Protection Bits
 - `bit0` force safe active
@@ -252,7 +332,64 @@
 - `bit9` humidity sensor fault
 
 Weather is treated as unsafe/stale by the window controller when the weather
-snapshot is missing, stale by age, or `WEATHER_STATUS_BITS != 0`.
+snapshot is missing, stale by age, or `WEATHER_STATUS_BITS bit15` is set.
+Normal station status bits such as `bit0=active` and `bit1=data valid` do not
+trigger weather safe closing.
+
+## Recommended HMI Set For Windows
+
+### Daily Operator Set
+- `103` WINDOWS_POS_A_TARGET, `x10 %`, manual target for window A
+- `104` WINDOWS_POS_B_TARGET, `x10 %`, manual target for window B
+- `171` WINDOWS_CTRL_MODE: `0=AUTO`, `1=MANUAL`
+- `173` WINDOWS_TEMP_SETPOINT, `x10 C`
+- `180` WINDOWS_TEMP_STEP_C, `x10 C`
+- `181` WINDOWS_TEMP_STEP_HYST_C, `x10 C`
+- `195` WINDOWS_AUTO_ALGO_MODE: `0=TEMP`, `1=HUMIDITY`
+- `196` WINDOWS_HUM_SETPOINT, `x10 %`
+- `197` WINDOWS_HUM_STEP, `x10 %`
+- `198` WINDOWS_HUM_STEP_HYST, `x10 %`
+- `199` WINDOWS_COLD_CLOSE_DELTA, `x10 C`
+- `200` WINDOWS_COLD_CLOSE_HYST, `x10 C`
+- `219` WINDOWS_TEMP_STEP_TARGET_PERCENT, `x10 %`
+- `221` WINDOWS_HUM_STEP_TARGET_PERCENT, `x10 %`
+
+### Protection And Climate Tuning
+- `172` WINDOWS_FORCE_SAFE_CMD
+- `174` WINDOWS_SAFE_MIN_PERCENT, `x10 %`
+- `176` WINDOWS_WIND_STORM, `x10 m/s`
+- `177` WINDOWS_WIND_RECOVER, `x10 m/s`
+- `178` WINDOW_A_AZIMUTH_DEG
+- `179` WINDOWS_WIND_SECTOR_HALF_WIDTH_DEG
+- `201` WINDOWS_WINDWARD_MIN_PERCENT, `x10 %`
+- `202` WINDOWS_WINDWARD_MAX_PERCENT, `x10 %`
+- `203` WINDOWS_WINDWARD_SPEED_THRESHOLD, `x10 m/s`
+- `204` WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS, `x10 %/m/s`
+- `205` WINDOWS_LEEWARD_MIN_PERCENT, `x10 %`
+- `206` WINDOWS_LEEWARD_MAX_PERCENT, `x10 %`
+- `207` WINDOWS_LEEWARD_SPEED_THRESHOLD, `x10 m/s`
+- `208` WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS, `x10 %/m/s`
+- `209` WINDOWS_WINDWARD_LAG_PERCENT, `x10 %`
+- `210` WINDOWS_RAIN_MODE: `0=OFF`, `1=WINDWARD`
+- `211` WINDOWS_RAIN_WINDWARD_PERCENT, `x10 %`
+- `212` WINDOWS_WEATHER_STALE_POLICY: `0=CLOSE_SAFE`, `1=IGNORE`
+- `223` WINDOWS_WEATHER_STALE_TIMEOUT_MS
+- `224` WINDOWS_WEATHER_SOURCE_AGE_S
+
+### Commissioning And Service
+- `182` RLL400_TARGET_HYST_PERCENT, `x10 %`; used as motor deadband and
+  effective-target stabilization deadband
+- `183` RLL400_MOTION_DELTA_PERCENT, `x10 %`
+- `184` RLL400_NO_MOTION_TIMEOUT_MS
+
+### Usually Hide From The Operator Panel
+- `175` WINDOWS_WIND_LIMIT, legacy/default fallback
+- `185` WINDOW_A_FAULT_RESET_TOKEN, service
+- `186` WINDOW_B_FAULT_RESET_TOKEN, service
+- `187..194` status and fault telemetry, RO
+- `213..218` computed diagnostics, RO
+- `220` WINDOWS_TEMP_STEP_MAX_INDEX, legacy/reserved
+- `222` WINDOWS_HUM_STEP_MAX_INDEX, legacy/reserved
 
 ## Persist/Reboot
 - Active light config и `ACTIVE_CTRL_VERSION` сохраняются в NVS (`light_state`) с CRC32.

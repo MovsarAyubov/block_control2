@@ -13,11 +13,12 @@ typedef struct {
   gpio_num_t data_gpio_num;
   gpio_num_t clock_gpio_num;
   gpio_num_t latch_gpio_num;
+  uint8_t chip_count;
   uint8_t relay1_bit_index;
   uint8_t relay2_bit_index;
   uint8_t valve_open_bit_index;
   uint8_t valve_close_bit_index;
-  uint8_t initial_state;
+  uint32_t initial_state;
 } hc595_outputs_config_t;
 
 typedef struct hc595_outputs_ctx_t *hc595_outputs_handle_t;
@@ -35,6 +36,9 @@ esp_err_t hc595_outputs_set_light_relays(hc595_outputs_handle_t handle,
 esp_err_t hc595_outputs_set_valve_state(
     hc595_outputs_handle_t handle, hc595_outputs_valve_state_t valve_state);
 uint8_t hc595_outputs_get_raw_state(hc595_outputs_handle_t handle);
+uint32_t hc595_outputs_get_state(hc595_outputs_handle_t handle);
+esp_err_t hc595_outputs_write_masked(hc595_outputs_handle_t handle,
+                                     uint32_t mask, uint32_t value);
 esp_err_t hc595_outputs_del(hc595_outputs_handle_t handle);
 
 #ifdef __cplusplus

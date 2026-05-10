@@ -6,14 +6,26 @@
 struct hc595_outputs_ctx_t {
   hc595_outputs_config_t cfg;
   hc595_handle_t shift_reg;
-  uint8_t relay_mask;
-  uint8_t valve_mask;
+  uint32_t relay_mask;
+  uint32_t valve_mask;
 };
 
-static bool hc595_outputs_bit_valid(uint8_t bit_index) { return bit_index < 8U; }
+static uint8_t hc595_outputs_effective_chip_count(
+    const hc595_outputs_config_t *cfg) {
+  if (cfg == NULL || cfg->chip_count == 0U) {
+    return 1U;
+  }
+  return cfg->chip_count;
+}
 
-static uint8_t hc595_outputs_bit_mask(uint8_t bit_index) {
-  return (uint8_t)(1U << bit_index);
+static bool hc595_outputs_bit_valid(const hc595_outputs_config_t *cfg,
+                                    uint8_t bit_index) {
+  const uint8_t chip_count = hc595_outputs_effective_chip_count(cfg);
+  return chip_count <= 3U && bit_index < (uint8_t)(chip_count * 8U);
+}
+
+static uint32_t hc595_outputs_bit_mask(uint8_t bit_index) {
+  return (1UL << bit_index);
 }
 
 esp_err_t hc595_outputs_init(const hc595_outputs_config_t *config,
@@ -21,18 +33,18 @@ esp_err_t hc595_outputs_init(const hc595_outputs_config_t *config,
   if (config == NULL || ret_handle == NULL) {
     return ESP_ERR_INVALID_ARG;
   }
-  if (!hc595_outputs_bit_valid(config->relay1_bit_index) ||
-      !hc595_outputs_bit_valid(config->relay2_bit_index) ||
-      !hc595_outputs_bit_valid(config->valve_open_bit_index) ||
-      !hc595_outputs_bit_valid(config->valve_close_bit_index)) {
+  if (!hc595_outputs_bit_valid(config, config->relay1_bit_index) ||
+      !hc595_outputs_bit_valid(config, config->relay2_bit_index) ||
+      !hc595_outputs_bit_valid(config, config->valve_open_bit_index) ||
+      !hc595_outputs_bit_valid(config, config->valve_close_bit_index)) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  const uint8_t relay1_mask = hc595_outputs_bit_mask(config->relay1_bit_index);
-  const uint8_t relay2_mask = hc595_outputs_bit_mask(config->relay2_bit_index);
-  const uint8_t valve_open_mask =
+  const uint32_t relay1_mask = hc595_outputs_bit_mask(config->relay1_bit_index);
+  const uint32_t relay2_mask = hc595_outputs_bit_mask(config->relay2_bit_index);
+  const uint32_t valve_open_mask =
       hc595_outputs_bit_mask(config->valve_open_bit_index);
-  const uint8_t valve_close_mask =
+  const uint32_t valve_close_mask =
       hc595_outputs_bit_mask(config->valve_close_bit_index);
 
   if ((relay1_mask & relay2_mask) != 0U || (relay1_mask & valve_open_mask) != 0U ||
@@ -50,13 +62,15 @@ esp_err_t hc595_outputs_init(const hc595_outputs_config_t *config,
   }
 
   ctx->cfg = *config;
-  ctx->relay_mask = (uint8_t)(relay1_mask | relay2_mask);
-  ctx->valve_mask = (uint8_t)(valve_open_mask | valve_close_mask);
+  ctx->cfg.chip_count = hc595_outputs_effective_chip_count(config);
+  ctx->relay_mask = relay1_mask | relay2_mask;
+  ctx->valve_mask = valve_open_mask | valve_close_mask;
 
   hc595_config_t low_level_cfg = {
       .data_gpio_num = config->data_gpio_num,
       .clock_gpio_num = config->clock_gpio_num,
       .latch_gpio_num = config->latch_gpio_num,
+      .chip_count = ctx->cfg.chip_count,
       .initial_state = config->initial_state,
   };
   esp_err_t err = hc595_init(&low_level_cfg, &ctx->shift_reg);
@@ -75,7 +89,7 @@ esp_err_t hc595_outputs_set_light_relays(hc595_outputs_handle_t handle,
     return ESP_ERR_INVALID_ARG;
   }
 
-  uint8_t value = 0U;
+  uint32_t value = 0U;
   if (relay1_on) {
     value |= hc595_outputs_bit_mask(handle->cfg.relay1_bit_index);
   }
@@ -92,7 +106,7 @@ esp_err_t hc595_outputs_set_valve_state(
     return ESP_ERR_INVALID_ARG;
   }
 
-  uint8_t value = 0U;
+  uint32_t value = 0U;
   if (valve_state == HC595_OUTPUTS_VALVE_OPENING) {
     value |= hc595_outputs_bit_mask(handle->cfg.valve_open_bit_index);
   } else if (valve_state == HC595_OUTPUTS_VALVE_CLOSING) {
@@ -106,7 +120,22 @@ uint8_t hc595_outputs_get_raw_state(hc595_outputs_handle_t handle) {
   if (handle == NULL || handle->shift_reg == NULL) {
     return 0U;
   }
+  return (uint8_t)(hc595_get_state(handle->shift_reg) & 0xFFU);
+}
+
+uint32_t hc595_outputs_get_state(hc595_outputs_handle_t handle) {
+  if (handle == NULL || handle->shift_reg == NULL) {
+    return 0U;
+  }
   return hc595_get_state(handle->shift_reg);
+}
+
+esp_err_t hc595_outputs_write_masked(hc595_outputs_handle_t handle,
+                                     uint32_t mask, uint32_t value) {
+  if (handle == NULL || handle->shift_reg == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  return hc595_write_masked(handle->shift_reg, mask, value);
 }
 
 esp_err_t hc595_outputs_del(hc595_outputs_handle_t handle) {

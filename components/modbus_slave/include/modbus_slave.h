@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define MODBUS_HREG_TOTAL_COUNT 225
+#define MODBUS_HREG_TOTAL_COUNT 243
 
 // Telemetry map (MUST): base + 0..8, int16 x10
 #define MODBUS_HREG_AIR_TEMP 0
@@ -160,6 +160,26 @@ extern "C" {
 #define MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS 223
 #define MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S 224
 
+// Heating control/runtime registers
+#define MODBUS_HREG_HEATING_CTRL_MODE 225
+#define MODBUS_HREG_HEATING_AIR_SETPOINT 226
+#define MODBUS_HREG_HEATING_AIR_HYST 227
+#define MODBUS_HREG_HEATING_STAGE_DELTA_1 228
+#define MODBUS_HREG_HEATING_STAGE_DELTA_2 229
+#define MODBUS_HREG_HEATING_STAGE_DELTA_3 230
+#define MODBUS_HREG_HEATING_STAGE_DELTA_4 231
+#define MODBUS_HREG_HEATING_MIN_ON_S 232
+#define MODBUS_HREG_HEATING_MIN_OFF_S 233
+#define MODBUS_HREG_HEATING_MANUAL_PUMP_MASK 234
+#define MODBUS_HREG_HEATING_MANUAL_VALVE_OPEN_MASK 235
+#define MODBUS_HREG_HEATING_MANUAL_VALVE_CLOSE_MASK 236
+#define MODBUS_HREG_HEATING_STATUS_BITS 237
+#define MODBUS_HREG_HEATING_ACTIVE_STAGE 238
+#define MODBUS_HREG_HEATING_PUMP_MASK 239
+#define MODBUS_HREG_HEATING_VALVE_OPEN_MASK 240
+#define MODBUS_HREG_HEATING_VALVE_CLOSE_MASK 241
+#define MODBUS_HREG_HEATING_SENSOR_STATUS_BITS 242
+
 typedef enum {
   MODBUS_MODE_REMOTE = 0,
   MODBUS_MODE_AUTONOMOUS = 1,
@@ -204,6 +224,12 @@ typedef enum {
 } modbus_water_channel_t;
 
 typedef enum {
+  MODBUS_HEATING_CTRL_MODE_AUTO = 0,
+  MODBUS_HEATING_CTRL_MODE_OFF = 1,
+  MODBUS_HEATING_CTRL_MODE_MANUAL = 2,
+} modbus_heating_ctrl_mode_t;
+
+typedef enum {
   MODBUS_WINDOWS_CTRL_MODE_AUTO = 0,
   MODBUS_WINDOWS_CTRL_MODE_MANUAL = 1,
 } modbus_windows_ctrl_mode_t;
@@ -246,6 +272,13 @@ typedef struct {
   bool rain_active;
 } modbus_weather_runtime_t;
 
+typedef struct {
+  bool air_temp_override_active;
+  bool rh_override_active;
+  float air_temp_c;
+  float rh_percent;
+} modbus_sensor_test_override_t;
+
 typedef bool (*modbus_rtc_get_time_cb_t)(uint8_t *hour, uint8_t *minute,
                                          uint8_t *second, void *ctx);
 typedef bool (*modbus_rtc_set_time_cb_t)(uint8_t hour, uint8_t minute,
@@ -266,6 +299,8 @@ void modbus_get_light_relay_state(bool *relay1_on, bool *relay2_on);
 void modbus_set_solar_radiation(float radiation);
 esp_err_t modbus_handle_ascii_command(const char *line, char *response,
                                       size_t response_len);
+void modbus_get_sensor_test_override(
+    modbus_sensor_test_override_t *out_override);
 
 float modbus_get_window_a_target_percent(void);
 float modbus_get_window_b_target_percent(void);
@@ -324,6 +359,19 @@ void modbus_set_windows_target_diagnostics(
     uint16_t active_protection_bits,
     modbus_windows_windward_side_t windward_side);
 float modbus_get_water_setpoint_c(modbus_water_channel_t channel);
+modbus_heating_ctrl_mode_t modbus_get_heating_ctrl_mode(void);
+float modbus_get_heating_air_setpoint_c(void);
+float modbus_get_heating_air_hysteresis_c(void);
+float modbus_get_heating_stage_delta_c(uint8_t stage_index);
+uint16_t modbus_get_heating_min_on_s(void);
+uint16_t modbus_get_heating_min_off_s(void);
+uint16_t modbus_get_heating_manual_pump_mask(void);
+uint16_t modbus_get_heating_manual_valve_open_mask(void);
+uint16_t modbus_get_heating_manual_valve_close_mask(void);
+void modbus_set_heating_runtime(uint16_t status_bits, uint16_t active_stage,
+                                uint16_t pump_mask, uint16_t valve_open_mask,
+                                uint16_t valve_close_mask,
+                                uint16_t sensor_status_bits);
 modbus_mode_state_t modbus_get_mode_state(void);
 bool modbus_is_autonomous(void);
 

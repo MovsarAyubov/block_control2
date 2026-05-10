@@ -33,9 +33,13 @@
 - ESP32 `GPIO14` -> `MAX31865 SDI`
 - ESP32 `GPIO12` -> `MAX31865 SDO`
 - ESP32 `GPIO13` -> `MAX31865 CLK`
-- ESP32 `GPIO15` -> `MAX31865 CS1`
-- ESP32 `GPIO5` -> `MAX31865 CS2`
-- Оба `MAX31865` используют общие линии `SDI/SDO/CLK`, различается только `CS`.
+- ESP32 `GPIO15` -> `MAX31865 AIR CS`
+- ESP32 `GPIO5` -> `MAX31865 WATER_RAIL CS`
+- ESP32 `GPIO16` -> `MAX31865 WATER_UPPER CS`
+- ESP32 `GPIO17` -> `MAX31865 WATER_UNDERTRAY CS`
+- ESP32 `GPIO0` -> `MAX31865 WATER_GROW CS`
+- Все `MAX31865` используют общие линии `SDI/SDO/CLK`, различается только `CS`.
+- `GPIO0` является boot strap pin; если шкафная разводка позволяет, предпочтительно заменить его на другой свободный CS.
 
 ### 2.3 Исполнительные Механизмы
 - Window A OPEN: GPIO32
@@ -48,18 +52,28 @@
   `4 mA -> 0.437 V`, `20 mA -> 2.186 V`
 - В прошивке ток пересчитывается по формуле:
   `I(mA) = U(mV) / 109.3`
-- 3-way valve OPEN: через `74HC595 Q2`
-- 3-way valve CLOSE: через `74HC595 Q3`
+- 3-way valves and pump contactors: через каскад из трех `74HC595`.
 
 ### 2.3.1 74HC595
 - ESP32 GPIO2 -> `SER/DS`
 - ESP32 GPIO4 -> `SHCP/SRCLK`
 - ESP32 GPIO18 -> `STCP/RCLK`
-- `Q0` -> Relay 1
-- `Q1` -> Relay 2
-- `Q2` -> 3-way valve OPEN
-- `Q3` -> 3-way valve CLOSE
-- В текущей реализации свет и один `3-way valve` управляются через `74HC595`.
+- `bit0` -> Relay 1
+- `bit1` -> Relay 2
+- `bit2` -> Rail valve OPEN
+- `bit3` -> Rail valve CLOSE
+- `bit4` -> Upper valve OPEN
+- `bit5` -> Upper valve CLOSE
+- `bit6` -> Undertray valve OPEN
+- `bit7` -> Undertray valve CLOSE
+- `bit8` -> Grow pipe valve OPEN
+- `bit9` -> Grow pipe valve CLOSE
+- `bit10` -> Rail pump contactor
+- `bit11` -> Upper pump contactor
+- `bit12` -> Undertray pump contactor
+- `bit13` -> Grow pipe pump contactor
+- `bit14..23` -> резерв
+- Свет, клапаны отопления и насосы отопления управляются через `74HC595`.
 - Управление форточками вынесено на отдельные GPIO и не использует latch `74HC595`.
 
 ### 2.4 Освещение
@@ -72,7 +86,7 @@
 
 ## 3. Запуск Прошивки
 1. Подайте питание и убедитесь, что RS485 и I2C физически подключены.
-2. После старта инициализируются: NVS, Modbus, I2C, RTC DS3231, RH/ADS1115, RLL400, MAX31865(1/2), клапан.
+2. После старта инициализируются: NVS, Modbus, I2C, RTC DS3231, RH/ADS1115, RLL400, MAX31865 air/water, клапаны и насосы отопления.
 3. Запускаются две задачи:
    - быстрая `200 ms`: позиционирование и управление relay света
    - медленная `5 s`: опрос датчиков, обновление телеметрии и времени
@@ -178,6 +192,12 @@
 7. RTC-синхронизация дает `APPLIED`/`NOOP` для валидной команды.
 8. Weather sync по `FC16(158, 11)` дает подтверждение через `169..170`.
 9. При отсутствии heartbeat более `30 s` slave переходит в `AUTONOMOUS`.
+10. Отопление:
+   - при `HEATING_CTRL_MODE=AUTO` и температуре воздуха ниже уставки ступени включаются в порядке `rail -> upper -> undertray -> grow`;
+   - `239 HEATING_PUMP_MASK` показывает фактически включенные насосы;
+   - `240/241` показывают фактические команды открытия/закрытия клапанов;
+   - `242` должен быть `0` при исправных датчиках воздуха и воды;
+   - при отключении датчика воды одного контура выключается только насос этого контура, остальные контуры продолжают работу.
 
 ## 8. Примечания
 - Weather snapshot хранится только в RAM и после reboot не восстанавливается.

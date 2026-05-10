@@ -17,6 +17,7 @@ struct rll400_context_t {
   ads1115_handle_t ads_handle;
   float target_percent;
   float current_position_percent;
+  float current_voltage_mv;
   float current_ma;
   float last_valid_position_percent;
   float last_motion_position_percent;
@@ -204,6 +205,7 @@ static esp_err_t rll400_sample_encoder(struct rll400_context_t *ctx,
   esp_err_t err = ads1115_read_voltage_differential(
       ctx->ads_handle, ctx->config.ads_channel_pos, ctx->config.ads_channel_neg,
       &voltage_mv);
+  ctx->current_voltage_mv = voltage_mv;
   if (err != ESP_OK) {
     *out_valid = false;
     return err;
@@ -262,11 +264,12 @@ static void rll400_maybe_log_status(struct rll400_context_t *ctx,
                                                           : 0.0f);
 
   ESP_LOGI(TAG,
-           "[%s] status state=%s target=%.1f%% pos=%.1f%% current=%.2fmA "
+           "[%s] status state=%s target=%.1f%% pos=%.1f%% voltage=%.1fmV "
+           "current=%.2fmA "
            "valid=%u manual=%u outputs=%u control=%u fault=%s",
            rll400_name(ctx), rll400_state_name(ctx->state), ctx->target_percent,
-           position_percent, ctx->current_ma, ctx->position_valid ? 1U : 0U,
-           ctx->local_manual_active ? 1U : 0U,
+           position_percent, ctx->current_voltage_mv, ctx->current_ma,
+           ctx->position_valid ? 1U : 0U, ctx->local_manual_active ? 1U : 0U,
            rll400_outputs_enabled(ctx) ? 1U : 0U, ctx->control_active ? 1U : 0U,
            rll400_fault_name(ctx->fault_code));
 }

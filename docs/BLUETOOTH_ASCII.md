@@ -19,7 +19,11 @@ SPP with plain ASCII commands.
 - Window automation tuning commands write runtime holding registers directly.
 - Weather mock commands update the active weather snapshot in RAM immediately.
 - Weather mock data does not survive reboot.
-- Window safety treats weather as unsafe when `wx_stat` is non-zero.
+- Window safety treats weather as unsafe when `wx_stat bit15` is set. Normal
+  status values such as `0x0003` mean active/valid and do not trigger safe
+  closing.
+- Test sensor override commands can temporarily replace internal air temperature
+  and RH values used by window automation. They do not survive reboot.
 
 ## Short Names
 
@@ -102,6 +106,17 @@ The primary Bluetooth interface uses short readable names.
 | Source age, `s` | `wx_age` | `set wx_age 3` |
 | Status bits | `wx_stat` | `set wx_stat 1` |
 
+### Temporary Internal Sensor Overrides
+
+These commands are intended for commissioning only, so window algorithms can be
+tested without changing the real PT500/RH inputs.
+
+| Value | Short name | Example |
+| --- | --- | --- |
+| Air temperature, `C` | `air_temp` | `set air_temp 25.0` |
+| Internal humidity, `%RH` | `air_rh` | `set air_rh 65.0` |
+| Disable all overrides | `sensor_override` | `set sensor_override off` |
+
 ## Supported Commands
 
 ### Introspection
@@ -111,6 +126,7 @@ The primary Bluetooth interface uses short readable names.
 - `show mode`
 - `show weather`
 - `show windows`
+- `show sensors`
 - `show light r1`
 - `show light r2`
 
@@ -163,6 +179,11 @@ The primary Bluetooth interface uses short readable names.
 - `set wx_dew 6.1`
 - `set wx_age 3`
 - `set wx_stat 1`
+- `set air_temp 25.0`
+- `set air_rh 65.0`
+- `set air_temp real`
+- `set air_rh real`
+- `set sensor_override off`
 
 Values:
 
@@ -175,6 +196,8 @@ Values:
 - `wx_age_max` is maximum weather source age in seconds, effective range `1..600`; `0` falls back to default
 - Wind thresholds are in `m/s`, valid range `0..100.0`
 - Wind reduction is in `% per m/s` above the role threshold
+- Wind reduction uses the normal `% per m/s` formula, but recalculates only
+  after wind speed changes by at least `0.5 m/s`
 - `rain_mode` accepts `off`, `on`, or `windward`
 - Water setpoints are in degrees Celsius, valid range `0..120.0`
 - Time accepts either `HH:MM` or `HHMM`
@@ -188,6 +211,11 @@ Values:
 - `wx_baro` range: `300.0..1200.0 hPa`
 - `wx_dew` range: `-80.0..80.0 C`
 - `wx_age` is source age in seconds
+- `air_temp` range: `-60.0..120.0 C`; use `real`, `sensor`, or `off` to return
+  that value to the physical sensor
+- `air_rh` range: `0..100 %`; use `real`, `sensor`, or `off` to return that
+  value to the physical sensor
+- `sensor_override off` disables both internal sensor overrides
 
 ### Legacy Long Form
 

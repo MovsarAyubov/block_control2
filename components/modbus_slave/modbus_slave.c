@@ -83,9 +83,18 @@ static const char *TAG = "MB_SLAVE";
   MODBUS_WINDOWS_WEATHER_STALE_CLOSE_SAFE
 #define MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_TIMEOUT_MS 20000U
 #define MODBUS_WINDOWS_DEFAULT_WEATHER_SOURCE_AGE_S 20U
-#define MODBUS_WINDOWS_DEFAULT_TARGET_HYST_PERCENT 10U
+#define MODBUS_WINDOWS_DEFAULT_TARGET_HYST_PERCENT 30U
 #define MODBUS_WINDOWS_DEFAULT_MOTION_DELTA_PERCENT 5U
 #define MODBUS_WINDOWS_DEFAULT_NO_MOTION_TIMEOUT_MS 3000U
+#define MODBUS_HEATING_DEFAULT_CTRL_MODE MODBUS_HEATING_CTRL_MODE_AUTO
+#define MODBUS_HEATING_DEFAULT_AIR_SETPOINT 200U
+#define MODBUS_HEATING_DEFAULT_AIR_HYST 5U
+#define MODBUS_HEATING_DEFAULT_STAGE_DELTA_1 3U
+#define MODBUS_HEATING_DEFAULT_STAGE_DELTA_2 10U
+#define MODBUS_HEATING_DEFAULT_STAGE_DELTA_3 20U
+#define MODBUS_HEATING_DEFAULT_STAGE_DELTA_4 30U
+#define MODBUS_HEATING_DEFAULT_MIN_ON_S 60U
+#define MODBUS_HEATING_DEFAULT_MIN_OFF_S 30U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -232,6 +241,10 @@ static weather_snapshot_t s_weather_active_snapshot = {0};
 static volatile uint32_t s_weather_last_rx_ms = 0;
 static volatile bool s_weather_valid = false;
 static volatile bool s_weather_stale = true;
+static volatile bool s_air_temp_override_active = false;
+static volatile bool s_rh_override_active = false;
+static volatile int16_t s_air_temp_override_tenths = 0;
+static volatile uint16_t s_rh_override_tenths = 0;
 
 static volatile uint32_t s_rtc_sync_applied_count = 0;
 static volatile uint32_t s_rtc_sync_noop_count = 0;
@@ -333,11 +346,22 @@ static bool reg_span_contains(uint16_t start_reg, uint16_t reg_count,
                               uint16_t target_reg);
 static bool reg_span_intersects(uint16_t start_reg, uint16_t reg_count,
                                 uint16_t first_reg, uint16_t last_reg);
+static bool reg_span_intersects_window_settings(uint16_t start_reg,
+                                                uint16_t reg_count);
+static bool write_span_intersects_window_settings(bool has_span,
+                                                  uint16_t start_reg,
+                                                  uint16_t alt_start_reg,
+                                                  uint16_t reg_count);
+static void log_window_settings_received(uint16_t start_reg,
+                                         uint16_t reg_count);
 static uint8_t get_active_light_schedule_mask(const light_control_cfg_t *cfg,
-                                              uint16_t minute_of_day);
+                                               uint16_t minute_of_day);
 static void log_active_light_schedules_if_changed(
     const light_control_cfg_t *cfg, modbus_mode_state_t mode,
     uint16_t minute_of_day, uint8_t active_mask);
+static const char *windows_ctrl_mode_to_string(modbus_windows_ctrl_mode_t mode);
+static const char *
+windows_auto_algo_to_string(modbus_windows_auto_algo_mode_t mode);
 static modbus_apply_status_t apply_control_block(
     const light_control_cfg_t *candidate_cfg);
 static esp_err_t apply_ascii_autonomous_update(const autonomous_ctrl_cfg_t *cfg,
@@ -1582,6 +1606,144 @@ static bool reg_span_intersects(uint16_t start_reg, uint16_t reg_count,
   return true;
 }
 
+static bool reg_span_intersects_window_settings(uint16_t start_reg,
+                                                uint16_t reg_count) {
+  return reg_span_intersects(start_reg, reg_count,
+                             MODBUS_HREG_WINDOWS_POS_A_TARGET,
+                             MODBUS_HREG_WINDOWS_POS_B_TARGET) ||
+         reg_span_intersects(start_reg, reg_count,
+                             MODBUS_HREG_WINDOWS_CTRL_MODE,
+                             MODBUS_HREG_RLL400_NO_MOTION_TIMEOUT_MS) ||
+         reg_span_intersects(start_reg, reg_count,
+                             MODBUS_HREG_WINDOWS_AUTO_ALGO_MODE,
+                             MODBUS_HREG_WINDOWS_WEATHER_STALE_POLICY) ||
+         reg_span_intersects(start_reg, reg_count,
+                             MODBUS_HREG_WINDOWS_TEMP_STEP_TARGET_PERCENT,
+                             MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S);
+}
+
+static bool write_span_intersects_window_settings(bool has_span,
+                                                  uint16_t start_reg,
+                                                  uint16_t alt_start_reg,
+                                                  uint16_t reg_count) {
+  return has_span &&
+         (reg_span_intersects_window_settings(start_reg, reg_count) ||
+          reg_span_intersects_window_settings(alt_start_reg, reg_count));
+}
+
+static void log_window_settings_received(uint16_t start_reg,
+                                         uint16_t reg_count) {
+  if (s_mbc_slave_handler == NULL) {
+    return;
+  }
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  const uint16_t requested_a =
+      s_holding_regs[MODBUS_HREG_WINDOWS_POS_A_TARGET];
+  const uint16_t requested_b =
+      s_holding_regs[MODBUS_HREG_WINDOWS_POS_B_TARGET];
+  const modbus_windows_ctrl_mode_t ctrl_mode =
+      (s_holding_regs[MODBUS_HREG_WINDOWS_CTRL_MODE] ==
+       (uint16_t)MODBUS_WINDOWS_CTRL_MODE_MANUAL)
+          ? MODBUS_WINDOWS_CTRL_MODE_MANUAL
+          : MODBUS_WINDOWS_CTRL_MODE_AUTO;
+  const modbus_windows_auto_algo_mode_t algo_mode =
+      (s_holding_regs[MODBUS_HREG_WINDOWS_AUTO_ALGO_MODE] ==
+       (uint16_t)MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY)
+          ? MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY
+          : MODBUS_WINDOWS_AUTO_ALGO_TEMP;
+  const uint16_t temp_sp = s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_SETPOINT];
+  const uint16_t temp_step = s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_C];
+  const uint16_t temp_hyst =
+      s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_HYST_C];
+  const uint16_t temp_open =
+      s_holding_regs[MODBUS_HREG_WINDOWS_TEMP_STEP_TARGET_PERCENT];
+  const uint16_t hum_sp = s_holding_regs[MODBUS_HREG_WINDOWS_HUM_SETPOINT];
+  const uint16_t hum_step = s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP];
+  const uint16_t hum_hyst = s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP_HYST];
+  const uint16_t hum_open =
+      s_holding_regs[MODBUS_HREG_WINDOWS_HUM_STEP_TARGET_PERCENT];
+  const uint16_t cold_delta =
+      s_holding_regs[MODBUS_HREG_WINDOWS_COLD_CLOSE_DELTA];
+  const uint16_t cold_hyst =
+      s_holding_regs[MODBUS_HREG_WINDOWS_COLD_CLOSE_HYST];
+  const uint16_t safe_min =
+      s_holding_regs[MODBUS_HREG_WINDOWS_SAFE_MIN_PERCENT];
+  const uint16_t storm = s_holding_regs[MODBUS_HREG_WINDOWS_WIND_STORM];
+  const uint16_t recover = s_holding_regs[MODBUS_HREG_WINDOWS_WIND_RECOVER];
+  const uint16_t azimuth = s_holding_regs[MODBUS_HREG_WINDOW_A_AZIMUTH_DEG];
+  const uint16_t sector =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WIND_SECTOR_HALF_WIDTH_DEG];
+  const uint16_t windward_min =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_MIN_PERCENT];
+  const uint16_t windward_max =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_MAX_PERCENT];
+  const uint16_t windward_thr =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_SPEED_THRESHOLD];
+  const uint16_t windward_reduce =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_REDUCTION_PERCENT_PER_MS];
+  const uint16_t leeward_min =
+      s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_MIN_PERCENT];
+  const uint16_t leeward_max =
+      s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_MAX_PERCENT];
+  const uint16_t leeward_thr =
+      s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_SPEED_THRESHOLD];
+  const uint16_t leeward_reduce =
+      s_holding_regs[MODBUS_HREG_WINDOWS_LEEWARD_REDUCTION_PERCENT_PER_MS];
+  const uint16_t wind_lag =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_LAG_PERCENT];
+  const uint16_t rain_mode = s_holding_regs[MODBUS_HREG_WINDOWS_RAIN_MODE];
+  const uint16_t rain_pos =
+      s_holding_regs[MODBUS_HREG_WINDOWS_RAIN_WINDWARD_PERCENT];
+  const uint16_t stale_policy =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_STALE_POLICY];
+  const uint16_t stale_timeout =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS];
+  const uint16_t source_age =
+      s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S];
+  const uint16_t target_hyst =
+      s_holding_regs[MODBUS_HREG_RLL400_TARGET_HYST_PERCENT];
+  const uint16_t motion_delta =
+      s_holding_regs[MODBUS_HREG_RLL400_MOTION_DELTA_PERCENT];
+  const uint16_t no_motion =
+      s_holding_regs[MODBUS_HREG_RLL400_NO_MOTION_TIMEOUT_MS];
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+
+  ESP_LOGI(TAG,
+           "Windows settings received from master: span=%u..%u mode=%s "
+           "alg=%s requested[A=%.1f%% B=%.1f%%] temp[sp=%.1fC step=%.1fC "
+           "hyst=%.1fC open=%.1f%%] hum[sp=%.1f%% step=%.1f%% hyst=%.1f%% "
+           "open=%.1f%%] cold[delta=%.1fC hyst=%.1fC]",
+           (unsigned)start_reg,
+           (unsigned)(start_reg + reg_count - 1U),
+           windows_ctrl_mode_to_string(ctrl_mode),
+           windows_auto_algo_to_string(algo_mode), ((float)requested_a) / 10.0f,
+           ((float)requested_b) / 10.0f, ((float)temp_sp) / 10.0f,
+           ((float)temp_step) / 10.0f, ((float)temp_hyst) / 10.0f,
+           ((float)temp_open) / 10.0f, ((float)hum_sp) / 10.0f,
+           ((float)hum_step) / 10.0f, ((float)hum_hyst) / 10.0f,
+           ((float)hum_open) / 10.0f, ((float)cold_delta) / 10.0f,
+           ((float)cold_hyst) / 10.0f);
+  ESP_LOGI(TAG,
+           "Windows protections received from master: safe=%.1f%% storm=%.1fm/s "
+           "recover=%.1fm/s azimuth=%u sector=%u windward[min=%.1f%% "
+           "max=%.1f%% thr=%.1fm/s reduce=%.1f%%/m/s] leeward[min=%.1f%% "
+           "max=%.1f%% thr=%.1fm/s reduce=%.1f%%/m/s] lag=%.1f%% "
+           "rain[mode=%u pos=%.1f%%] stale[policy=%u timeout=%ums age=%us] "
+           "rll400[hyst=%.1f%% motion=%.1f%% timeout=%ums]",
+           ((float)safe_min) / 10.0f, ((float)storm) / 10.0f,
+           ((float)recover) / 10.0f, (unsigned)azimuth, (unsigned)sector,
+           ((float)windward_min) / 10.0f, ((float)windward_max) / 10.0f,
+           ((float)windward_thr) / 10.0f, ((float)windward_reduce) / 10.0f,
+           ((float)leeward_min) / 10.0f, ((float)leeward_max) / 10.0f,
+           ((float)leeward_thr) / 10.0f, ((float)leeward_reduce) / 10.0f,
+           ((float)wind_lag) / 10.0f, (unsigned)rain_mode,
+           ((float)rain_pos) / 10.0f, (unsigned)stale_policy,
+           (unsigned)stale_timeout, (unsigned)source_age,
+           ((float)target_hyst) / 10.0f, ((float)motion_delta) / 10.0f,
+           (unsigned)no_motion);
+}
+
 static void sync_staging_schedule_from_current_regs(void) {
   light_control_cfg_t staging = {0};
   light_control_cfg_t prev_staging = {0};
@@ -1709,9 +1871,14 @@ static mb_exception_t modbus_fc_06_wrapper(void *ctx, uint8_t *frame,
                            MODBUS_HREG_WEATHER_SET_TOKEN) ||
        reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
                            MODBUS_HREG_WEATHER_SET_TOKEN));
+  bool writes_window_settings = write_span_intersects_window_settings(
+      has_span, start_reg, alt_start_reg, reg_count);
 
   mb_exception_t ex = invoke_wrapped_handler(0x06, ctx, frame, len_buf);
   if (ex == 0) {
+    if (writes_window_settings) {
+      log_window_settings_received(start_reg, reg_count);
+    }
     queue_rtc_sync_request_from_regs();
     if (writes_weather) {
       queue_weather_sync_request_from_regs();
@@ -1755,9 +1922,14 @@ static mb_exception_t modbus_fc_10_wrapper(void *ctx, uint8_t *frame,
                            MODBUS_HREG_WEATHER_SET_TOKEN) ||
        reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
                            MODBUS_HREG_WEATHER_SET_TOKEN));
+  bool writes_window_settings = write_span_intersects_window_settings(
+      has_span, start_reg, alt_start_reg, reg_count);
 
   mb_exception_t ex = invoke_wrapped_handler(0x10, ctx, frame, len_buf);
   if (ex == 0) {
+    if (writes_window_settings) {
+      log_window_settings_received(start_reg, reg_count);
+    }
     queue_rtc_sync_request_from_regs();
     if (writes_weather) {
       queue_weather_sync_request_from_regs();
@@ -1801,9 +1973,14 @@ static mb_exception_t modbus_fc_17_wrapper(void *ctx, uint8_t *frame,
                            MODBUS_HREG_WEATHER_SET_TOKEN) ||
        reg_span_intersects(alt_start_reg, reg_count, MODBUS_HREG_WEATHER_OUT_TEMP,
                            MODBUS_HREG_WEATHER_SET_TOKEN));
+  bool writes_window_settings = write_span_intersects_window_settings(
+      has_span, start_reg, alt_start_reg, reg_count);
 
   mb_exception_t ex = invoke_wrapped_handler(0x17, ctx, frame, len_buf);
   if (ex == 0) {
+    if (writes_window_settings) {
+      log_window_settings_received(start_reg, reg_count);
+    }
     queue_rtc_sync_request_from_regs();
     if (writes_weather) {
       queue_weather_sync_request_from_regs();
@@ -2171,6 +2348,33 @@ void modbus_init(void) {
   s_holding_regs[MODBUS_HREG_WINDOWS_ACTIVE_PROTECTION_BITS] = 0U;
   s_holding_regs[MODBUS_HREG_WINDOWS_WINDWARD_SIDE] =
       MODBUS_WINDOWS_WINDWARD_SIDE_NONE;
+  s_holding_regs[MODBUS_HREG_HEATING_CTRL_MODE] =
+      MODBUS_HEATING_DEFAULT_CTRL_MODE;
+  s_holding_regs[MODBUS_HREG_HEATING_AIR_SETPOINT] =
+      MODBUS_HEATING_DEFAULT_AIR_SETPOINT;
+  s_holding_regs[MODBUS_HREG_HEATING_AIR_HYST] =
+      MODBUS_HEATING_DEFAULT_AIR_HYST;
+  s_holding_regs[MODBUS_HREG_HEATING_STAGE_DELTA_1] =
+      MODBUS_HEATING_DEFAULT_STAGE_DELTA_1;
+  s_holding_regs[MODBUS_HREG_HEATING_STAGE_DELTA_2] =
+      MODBUS_HEATING_DEFAULT_STAGE_DELTA_2;
+  s_holding_regs[MODBUS_HREG_HEATING_STAGE_DELTA_3] =
+      MODBUS_HEATING_DEFAULT_STAGE_DELTA_3;
+  s_holding_regs[MODBUS_HREG_HEATING_STAGE_DELTA_4] =
+      MODBUS_HEATING_DEFAULT_STAGE_DELTA_4;
+  s_holding_regs[MODBUS_HREG_HEATING_MIN_ON_S] =
+      MODBUS_HEATING_DEFAULT_MIN_ON_S;
+  s_holding_regs[MODBUS_HREG_HEATING_MIN_OFF_S] =
+      MODBUS_HEATING_DEFAULT_MIN_OFF_S;
+  s_holding_regs[MODBUS_HREG_HEATING_MANUAL_PUMP_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_MANUAL_VALVE_OPEN_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_MANUAL_VALVE_CLOSE_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_ACTIVE_STAGE] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_PUMP_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_VALVE_OPEN_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_VALVE_CLOSE_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_HEATING_SENSOR_STATUS_BITS] = 0U;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_apply_pending = false;
@@ -3192,6 +3396,100 @@ static esp_err_t handle_ascii_weather_short_alias_command(size_t token_count,
   return ESP_ERR_NOT_SUPPORTED;
 }
 
+static esp_err_t handle_ascii_sensor_test_alias_command(size_t token_count,
+                                                        char *tokens[],
+                                                        char *response,
+                                                        size_t response_len) {
+  if (token_count != 2U || tokens == NULL || response == NULL ||
+      response_len == 0U) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  const char *name = tokens[0];
+  const char *value = tokens[1];
+  const bool disable_value =
+      strcmp(value, "off") == 0 || strcmp(value, "real") == 0 ||
+      strcmp(value, "sensor") == 0 || strcmp(value, "disable") == 0;
+
+  if (strcmp(name, "sensor_override") == 0 ||
+      strcmp(name, "sensor_test") == 0) {
+    uint16_t enabled = 0U;
+    if (parse_switch_ascii(value, &enabled)) {
+      taskENTER_CRITICAL(&s_state_lock);
+      if (!enabled) {
+        s_air_temp_override_active = false;
+        s_rh_override_active = false;
+      }
+      taskEXIT_CRITICAL(&s_state_lock);
+
+      if (enabled) {
+        snprintf(response, response_len,
+                 "ERR set air_temp/air_rh value to enable override");
+        return ESP_ERR_INVALID_ARG;
+      }
+
+      snprintf(response, response_len, "OK sensor_override=off");
+      return ESP_OK;
+    }
+
+    snprintf(response, response_len, "ERR invalid sensor_override value");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (strcmp(name, "air_temp") == 0 || strcmp(name, "test_air_temp") == 0) {
+    if (disable_value) {
+      taskENTER_CRITICAL(&s_state_lock);
+      s_air_temp_override_active = false;
+      taskEXIT_CRITICAL(&s_state_lock);
+      snprintf(response, response_len, "OK air_temp=real");
+      return ESP_OK;
+    }
+
+    int16_t temp_tenths = 0;
+    if (!parse_signed_tenths_ascii(value, -60.0f, 120.0f, &temp_tenths)) {
+      snprintf(response, response_len, "ERR invalid air temperature");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    taskENTER_CRITICAL(&s_state_lock);
+    s_air_temp_override_tenths = temp_tenths;
+    s_air_temp_override_active = true;
+    taskEXIT_CRITICAL(&s_state_lock);
+
+    snprintf(response, response_len, "OK air_temp=%.1fC override=on",
+             ((float)temp_tenths) / 10.0f);
+    return ESP_OK;
+  }
+
+  if (strcmp(name, "air_rh") == 0 || strcmp(name, "test_rh") == 0 ||
+      strcmp(name, "rh") == 0) {
+    if (disable_value) {
+      taskENTER_CRITICAL(&s_state_lock);
+      s_rh_override_active = false;
+      taskEXIT_CRITICAL(&s_state_lock);
+      snprintf(response, response_len, "OK air_rh=real");
+      return ESP_OK;
+    }
+
+    uint16_t rh_tenths = 0U;
+    if (!parse_tenths_ascii(value, 0.0f, 100.0f, &rh_tenths)) {
+      snprintf(response, response_len, "ERR invalid air humidity");
+      return ESP_ERR_INVALID_ARG;
+    }
+
+    taskENTER_CRITICAL(&s_state_lock);
+    s_rh_override_tenths = rh_tenths;
+    s_rh_override_active = true;
+    taskEXIT_CRITICAL(&s_state_lock);
+
+    snprintf(response, response_len, "OK air_rh=%.1f%% override=on",
+             ((float)rh_tenths) / 10.0f);
+    return ESP_OK;
+  }
+
+  return ESP_ERR_NOT_SUPPORTED;
+}
+
 typedef struct {
   const char *name;
   uint16_t reg;
@@ -3339,6 +3637,12 @@ static esp_err_t handle_ascii_short_alias_command(size_t token_count,
       token_count, tokens, response, response_len);
   if (weather_result != ESP_ERR_NOT_SUPPORTED) {
     return weather_result;
+  }
+
+  esp_err_t sensor_test_result = handle_ascii_sensor_test_alias_command(
+      token_count, tokens, response, response_len);
+  if (sensor_test_result != ESP_ERR_NOT_SUPPORTED) {
+    return sensor_test_result;
   }
 
   esp_err_t window_settings_result = handle_ascii_window_settings_alias_command(
@@ -3567,6 +3871,23 @@ static esp_err_t handle_ascii_show_command(size_t token_count, char *tokens[],
 
   if (token_count == 1U && strcmp(tokens[0], "weather") == 0) {
     format_weather_summary(response, response_len);
+    return ESP_OK;
+  }
+
+  if (token_count == 1U && strcmp(tokens[0], "sensors") == 0) {
+    modbus_sensor_test_override_t override = {0};
+    modbus_get_sensor_test_override(&override);
+    snprintf(response, response_len,
+             "OK sensor_override air_temp=%s",
+             override.air_temp_override_active ? "on" : "off");
+    const size_t used = strlen(response);
+    if (used < response_len) {
+      snprintf(response + used, response_len - used,
+               " value=%.1fC air_rh=%s value=%.1f%%",
+               override.air_temp_c,
+               override.rh_override_active ? "on" : "off",
+               override.rh_percent);
+    }
     return ESP_OK;
   }
 
@@ -3872,7 +4193,7 @@ esp_err_t modbus_handle_ascii_command(const char *line, char *response,
 
   if (strcmp(tokens[0], "help") == 0 || strcmp(tokens[0], "?") == 0) {
     snprintf(response, response_len,
-             "OK show: autonomous mode light weather windows; set: win_a_pos win_b_pos "
+             "OK show: autonomous mode light weather windows sensors; set: win_a_pos win_b_pos "
              "curt_pos sp_rail sp_grow sp_upper sp_under l1_en l1_on l1_off "
              "l2_en l2_on l2_off light_hyst win_mode win_alg temp_open "
              "hum_sp hum_step hum_hyst hum_open cold_close cold_hyst "
@@ -3880,7 +4201,7 @@ esp_err_t modbus_handle_ascii_command(const char *line, char *response,
              "windward_thr windward_reduce leeward_min leeward_max leeward_thr "
              "leeward_reduce wind_lag rain_mode rain_pos wx_stale_ms wx_age_max "
              "wx_temp wx_hum wx_wind wx_dir wx_rain wx_solar wx_baro wx_dew "
-             "wx_age wx_stat");
+             "wx_age wx_stat air_temp air_rh sensor_override");
     return ESP_OK;
   }
 
@@ -4195,6 +4516,23 @@ void modbus_get_weather_runtime(modbus_weather_runtime_t *out_runtime) {
   }
 }
 
+void modbus_get_sensor_test_override(
+    modbus_sensor_test_override_t *out_override) {
+  if (out_override == NULL) {
+    return;
+  }
+
+  modbus_sensor_test_override_t local = {0};
+  taskENTER_CRITICAL(&s_state_lock);
+  local.air_temp_override_active = s_air_temp_override_active;
+  local.rh_override_active = s_rh_override_active;
+  local.air_temp_c = ((float)s_air_temp_override_tenths) / 10.0f;
+  local.rh_percent = ((float)s_rh_override_tenths) / 10.0f;
+  taskEXIT_CRITICAL(&s_state_lock);
+
+  *out_override = local;
+}
+
 void modbus_set_windows_runtime(uint16_t windows_status_bits,
                                 uint16_t window_a_status_bits,
                                 uint16_t window_b_status_bits,
@@ -4314,6 +4652,70 @@ float modbus_get_water_setpoint_c(modbus_water_channel_t channel) {
   }
 
   return ((float)raw_target) / 10.0f;
+}
+
+modbus_heating_ctrl_mode_t modbus_get_heating_ctrl_mode(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_HEATING_CTRL_MODE);
+  if (raw == (uint16_t)MODBUS_HEATING_CTRL_MODE_MANUAL) {
+    return MODBUS_HEATING_CTRL_MODE_MANUAL;
+  }
+  if (raw == (uint16_t)MODBUS_HEATING_CTRL_MODE_OFF) {
+    return MODBUS_HEATING_CTRL_MODE_OFF;
+  }
+  return MODBUS_HEATING_CTRL_MODE_AUTO;
+}
+
+float modbus_get_heating_air_setpoint_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_HEATING_AIR_SETPOINT)) /
+         10.0f;
+}
+
+float modbus_get_heating_air_hysteresis_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_HEATING_AIR_HYST)) / 10.0f;
+}
+
+float modbus_get_heating_stage_delta_c(uint8_t stage_index) {
+  if (stage_index >= MODBUS_WATER_CHANNEL_COUNT) {
+    return 0.0f;
+  }
+  return ((float)modbus_read_holding_reg(
+              (uint16_t)(MODBUS_HREG_HEATING_STAGE_DELTA_1 + stage_index))) /
+         10.0f;
+}
+
+uint16_t modbus_get_heating_min_on_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_HEATING_MIN_ON_S);
+}
+
+uint16_t modbus_get_heating_min_off_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_HEATING_MIN_OFF_S);
+}
+
+uint16_t modbus_get_heating_manual_pump_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_HEATING_MANUAL_PUMP_MASK);
+}
+
+uint16_t modbus_get_heating_manual_valve_open_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_HEATING_MANUAL_VALVE_OPEN_MASK);
+}
+
+uint16_t modbus_get_heating_manual_valve_close_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_HEATING_MANUAL_VALVE_CLOSE_MASK);
+}
+
+void modbus_set_heating_runtime(uint16_t status_bits, uint16_t active_stage,
+                                uint16_t pump_mask, uint16_t valve_open_mask,
+                                uint16_t valve_close_mask,
+                                uint16_t sensor_status_bits) {
+  modbus_write_holding_reg(MODBUS_HREG_HEATING_STATUS_BITS, status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_HEATING_ACTIVE_STAGE, active_stage);
+  modbus_write_holding_reg(MODBUS_HREG_HEATING_PUMP_MASK, pump_mask);
+  modbus_write_holding_reg(MODBUS_HREG_HEATING_VALVE_OPEN_MASK,
+                           valve_open_mask);
+  modbus_write_holding_reg(MODBUS_HREG_HEATING_VALVE_CLOSE_MASK,
+                           valve_close_mask);
+  modbus_write_holding_reg(MODBUS_HREG_HEATING_SENSOR_STATUS_BITS,
+                           sensor_status_bits);
 }
 
 modbus_mode_state_t modbus_get_mode_state(void) {
