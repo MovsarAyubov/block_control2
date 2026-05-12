@@ -1,6 +1,10 @@
 #include "max31865.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "MAX31865";
@@ -35,7 +39,46 @@ struct max31865_ctx_t {
   max31865_config_t cfg;
 };
 
-static esp_err_t write_reg(spi_device_handle_t spi, uint8_t addr,
+static spi_device_handle_t s_shared_spi[SPI_HOST_MAX] = {0};
+static uint8_t s_shared_spi_refcount[SPI_HOST_MAX] = {0};
+
+static int max31865_host_index(spi_host_device_t host) {
+  return (host >= 0 && host < SPI_HOST_MAX) ? (int)host : -1;
+}
+
+static esp_err_t max31865_select(const struct max31865_ctx_t *ctx) {
+  if (ctx == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  gpio_set_level((gpio_num_t)ctx->cfg.cs_io_num, 0);
+  return ESP_OK;
+}
+
+static void max31865_deselect(const struct max31865_ctx_t *ctx) {
+  if (ctx != NULL) {
+    gpio_set_level((gpio_num_t)ctx->cfg.cs_io_num, 1);
+  }
+}
+
+static esp_err_t max31865_transmit(struct max31865_ctx_t *ctx,
+                                   spi_transaction_t *transaction) {
+  if (ctx == NULL || transaction == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t ret = spi_device_acquire_bus(ctx->spi, portMAX_DELAY);
+  if (ret == ESP_OK) {
+    ret = max31865_select(ctx);
+    if (ret == ESP_OK) {
+      ret = spi_device_polling_transmit(ctx->spi, transaction);
+    }
+    max31865_deselect(ctx);
+    spi_device_release_bus(ctx->spi);
+  }
+  return ret;
+}
+
+static esp_err_t write_reg(struct max31865_ctx_t *ctx, uint8_t addr,
                            uint8_t data) {
   esp_err_t ret;
   spi_transaction_t t;
@@ -53,11 +96,11 @@ static esp_err_t write_reg(spi_device_handle_t spi, uint8_t addr,
   t.length = 16;
   t.tx_buffer = tx_data;
 
-  ret = spi_device_transmit(spi, &t);
+  ret = max31865_transmit(ctx, &t);
   return ret;
 }
 
-static esp_err_t read_reg(spi_device_handle_t spi, uint8_t addr,
+static esp_err_t read_reg(struct max31865_ctx_t *ctx, uint8_t addr,
                           uint8_t *data) {
   esp_err_t ret;
   spi_transaction_t t;
@@ -70,12 +113,12 @@ static esp_err_t read_reg(spi_device_handle_t spi, uint8_t addr,
   t.tx_buffer = tx_data;
   t.rx_buffer = rx_data;
 
-  ret = spi_device_transmit(spi, &t);
+  ret = max31865_transmit(ctx, &t);
   *data = rx_data[1]; // Second byte is the data
   return ret;
 }
 
-static esp_err_t read_regs(spi_device_handle_t spi, uint8_t addr, uint8_t *data,
+static esp_err_t read_regs(struct max31865_ctx_t *ctx, uint8_t addr, uint8_t *data,
                            size_t len) {
   esp_err_t ret;
   spi_transaction_t t;
@@ -97,7 +140,7 @@ static esp_err_t read_regs(spi_device_handle_t spi, uint8_t addr, uint8_t *data,
   // phase usually, but good practice to zero or set them. The memset 0 in
   // struct init handled it.
 
-  ret = spi_device_transmit(spi, &t);
+  ret = max31865_transmit(ctx, &t);
 
   // Copy received data (skip first byte which is response to address/dummy)
   // Wait, standard SPI behavior:
@@ -115,6 +158,10 @@ esp_err_t max31865_init(const max31865_config_t *config,
                         max31865_handle_t *ret_handle) {
   if (!config || !ret_handle)
     return ESP_ERR_INVALID_ARG;
+  const int host_index = max31865_host_index(config->host);
+  if (host_index < 0 || !GPIO_IS_VALID_OUTPUT_GPIO(config->cs_io_num)) {
+    return ESP_ERR_INVALID_ARG;
+  }
 
   struct max31865_ctx_t *ctx = calloc(1, sizeof(struct max31865_ctx_t));
   if (!ctx)
@@ -122,44 +169,58 @@ esp_err_t max31865_init(const max31865_config_t *config,
 
   ctx->cfg = *config;
 
-  // Initialize SPI Bus (if needed) - We assume user might initialize bus
-  // elsewhere, but here we can try to initialize. If it fails (already
-  // initialized), we ignore. However, best practice is user initializes bus.
-  // But given the prompt context, we should robustly handle bus initialization
-  // or assume it. Since we are using HSPI, let's initialize it here if we can.
-
-  spi_bus_config_t buscfg = {
-      .miso_io_num = config->miso_io_num,
-      .mosi_io_num = config->mosi_io_num,
-      .sclk_io_num = config->sclk_io_num,
-      .quadwp_io_num = -1,
-      .quadhd_io_num = -1,
-      .max_transfer_sz = 32,
+  gpio_config_t cs_cfg = {
+      .pin_bit_mask = 1ULL << config->cs_io_num,
+      .mode = GPIO_MODE_OUTPUT,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
   };
-
-  // Try to initialize bus. If it returns ESP_ERR_INVALID_STATE, it means
-  // already initialized.
-  esp_err_t ret = spi_bus_initialize(config->host, &buscfg, SPI_DMA_CH_AUTO);
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    ESP_LOGE(TAG, "Failed to initialize SPI bus");
-    free(ctx);
-    return ret;
-  }
-
-  // Add device to bus
-  spi_device_interface_config_t devcfg = {
-      .clock_speed_hz = 1000000, // 1 MHz
-      .mode = 1, // CPOL=0, CPHA=1 (MAX31865 supports Mode 1 and 3)
-      .spics_io_num = config->cs_io_num,
-      .queue_size = 1,
-  };
-
-  ret = spi_bus_add_device(config->host, &devcfg, &ctx->spi);
+  esp_err_t ret = gpio_config(&cs_cfg);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to add device to SPI bus");
+    ESP_LOGE(TAG, "Failed to configure CS GPIO %d: %s", config->cs_io_num,
+             esp_err_to_name(ret));
     free(ctx);
     return ret;
   }
+  gpio_set_level((gpio_num_t)config->cs_io_num, 1);
+
+  if (s_shared_spi[host_index] == NULL) {
+    spi_bus_config_t buscfg = {
+        .miso_io_num = config->miso_io_num,
+        .mosi_io_num = config->mosi_io_num,
+        .sclk_io_num = config->sclk_io_num,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
+    };
+
+    ret = spi_bus_initialize(config->host, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+      ESP_LOGE(TAG, "Failed to initialize SPI bus");
+      free(ctx);
+      return ret;
+    }
+
+    // Use one SPI device slot per host and drive every MAX31865 CS manually.
+    // ESP32 has only a small number of hardware CS/device slots per SPI host.
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 1000000, // 1 MHz
+        .mode = 1, // CPOL=0, CPHA=1 (MAX31865 supports Mode 1 and 3)
+        .spics_io_num = -1,
+        .queue_size = 1,
+    };
+
+    ret = spi_bus_add_device(config->host, &devcfg, &s_shared_spi[host_index]);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to add shared device to SPI bus: %s",
+               esp_err_to_name(ret));
+      free(ctx);
+      return ret;
+    }
+  }
+  ctx->spi = s_shared_spi[host_index];
+  ++s_shared_spi_refcount[host_index];
 
   // Configure MAX31865
   uint8_t config_byte = MAX31865_CONFIG_BIAS | MAX31865_CONFIG_FAULTSTAT |
@@ -169,20 +230,26 @@ esp_err_t max31865_init(const max31865_config_t *config,
   }
 
   // Write configuration
-  ret = write_reg(ctx->spi, MAX31865_CONFIG_REG, config_byte);
+  ret = write_reg(ctx, MAX31865_CONFIG_REG, config_byte);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to write config register: %s", esp_err_to_name(ret));
-    spi_bus_remove_device(ctx->spi);
+    if (--s_shared_spi_refcount[host_index] == 0U) {
+      spi_bus_remove_device(s_shared_spi[host_index]);
+      s_shared_spi[host_index] = NULL;
+    }
     free(ctx);
     return ret;
   }
 
   uint8_t readback_cfg = 0;
-  ret = read_reg(ctx->spi, MAX31865_CONFIG_REG, &readback_cfg);
+  ret = read_reg(ctx, MAX31865_CONFIG_REG, &readback_cfg);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to read back config register: %s",
              esp_err_to_name(ret));
-    spi_bus_remove_device(ctx->spi);
+    if (--s_shared_spi_refcount[host_index] == 0U) {
+      spi_bus_remove_device(s_shared_spi[host_index]);
+      s_shared_spi[host_index] = NULL;
+    }
     free(ctx);
     return ret;
   }
@@ -205,7 +272,7 @@ esp_err_t max31865_read_temp(max31865_handle_t handle, float *out_temp) {
   // 1-Shot bit. Let's read current config, add 1-shot bit, write back.
 
   uint8_t cfg;
-  esp_err_t ret = read_reg(ctx->spi, MAX31865_CONFIG_REG, &cfg);
+  esp_err_t ret = read_reg(ctx, MAX31865_CONFIG_REG, &cfg);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to read config register: %s", esp_err_to_name(ret));
     return ret;
@@ -216,7 +283,7 @@ esp_err_t max31865_read_temp(max31865_handle_t handle, float *out_temp) {
   if (ctx->cfg.three_wire)
     cfg |= MAX31865_CONFIG_3WIRE; // Ensure 3-wire is kept
 
-  ret = write_reg(ctx->spi, MAX31865_CONFIG_REG, cfg);
+  ret = write_reg(ctx, MAX31865_CONFIG_REG, cfg);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to trigger conversion: %s", esp_err_to_name(ret));
     return ret;
@@ -227,7 +294,7 @@ esp_err_t max31865_read_temp(max31865_handle_t handle, float *out_temp) {
 
   // Read RTD Registers (0x01 MSB, 0x02 LSB)
   uint8_t data[2];
-  ret = read_regs(ctx->spi, MAX31865_RTD_MSB_REG, data, 2);
+  ret = read_regs(ctx, MAX31865_RTD_MSB_REG, data, 2);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to read RTD registers: %s", esp_err_to_name(ret));
     return ret;
@@ -238,8 +305,8 @@ esp_err_t max31865_read_temp(max31865_handle_t handle, float *out_temp) {
   if (rtd_raw == 0x0000 || rtd_raw == 0xFFFF) {
     uint8_t fault = 0;
     uint8_t cfg_now = 0;
-    (void)read_reg(ctx->spi, MAX31865_FAULT_STATUS_REG, &fault);
-    (void)read_reg(ctx->spi, MAX31865_CONFIG_REG, &cfg_now);
+    (void)read_reg(ctx, MAX31865_FAULT_STATUS_REG, &fault);
+    (void)read_reg(ctx, MAX31865_CONFIG_REG, &cfg_now);
     ESP_LOGE(TAG,
              "Suspicious RTD raw value: 0x%04X (Fault: 0x%02X, Config: 0x%02X). "
              "Likely SPI wiring/communication issue or inactive CS/CLK.",
@@ -251,16 +318,16 @@ esp_err_t max31865_read_temp(max31865_handle_t handle, float *out_temp) {
   if (rtd_raw & 1) {
     // Fault detected
     uint8_t fault;
-    read_reg(ctx->spi, MAX31865_FAULT_STATUS_REG, &fault);
+    read_reg(ctx, MAX31865_FAULT_STATUS_REG, &fault);
     ESP_LOGE(
         TAG,
         "MAX31865 Fault detected: 0x%02X (Raw RTD: 0x%04X, Config: 0x%02X)",
         fault, rtd_raw, cfg);
 
     // Clear fault
-    read_reg(ctx->spi, MAX31865_CONFIG_REG, &cfg);
+    read_reg(ctx, MAX31865_CONFIG_REG, &cfg);
     cfg |= MAX31865_CONFIG_FAULTSTAT; // Write 1 to clear
-    write_reg(ctx->spi, MAX31865_CONFIG_REG, cfg);
+    write_reg(ctx, MAX31865_CONFIG_REG, cfg);
 
     *out_temp = 0.0f;
     return ESP_FAIL;
@@ -311,10 +378,13 @@ esp_err_t max31865_del(max31865_handle_t handle) {
   if (!handle)
     return ESP_ERR_INVALID_ARG;
   struct max31865_ctx_t *ctx = handle;
+  const int host_index = max31865_host_index(ctx->cfg.host);
 
-  spi_bus_remove_device(ctx->spi);
-  // Note: We do not free the bus here as it might be used by other devices
-  // or we don't track if we initialized it.
+  if (host_index >= 0 && s_shared_spi_refcount[host_index] > 0U &&
+      --s_shared_spi_refcount[host_index] == 0U) {
+    spi_bus_remove_device(s_shared_spi[host_index]);
+    s_shared_spi[host_index] = NULL;
+  }
 
   free(ctx);
   return ESP_OK;

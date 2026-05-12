@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define MODBUS_HREG_TOTAL_COUNT 243
+#define MODBUS_HREG_TOTAL_COUNT 244
 
 // Telemetry map (MUST): base + 0..8, int16 x10
 #define MODBUS_HREG_AIR_TEMP 0
@@ -179,6 +179,7 @@ extern "C" {
 #define MODBUS_HREG_HEATING_VALVE_OPEN_MASK 240
 #define MODBUS_HREG_HEATING_VALVE_CLOSE_MASK 241
 #define MODBUS_HREG_HEATING_SENSOR_STATUS_BITS 242
+#define MODBUS_HREG_WINDOWS_REACTION_DELAY_MS 243
 
 typedef enum {
   MODBUS_MODE_REMOTE = 0,
@@ -340,6 +341,7 @@ modbus_windows_weather_stale_policy_t
 modbus_get_windows_weather_stale_policy(void);
 uint32_t modbus_get_windows_weather_stale_timeout_ms(void);
 uint16_t modbus_get_windows_weather_source_age_limit_s(void);
+uint32_t modbus_get_windows_reaction_delay_ms(void);
 float modbus_get_rll400_target_hysteresis_percent(void);
 float modbus_get_rll400_motion_delta_percent(void);
 uint32_t modbus_get_rll400_no_motion_timeout_ms(void);

@@ -154,6 +154,7 @@ static const char *TAG = "APP";
 #define WINDOWS_STATUS_RAIN_LIMIT_B (1U << 10)
 #define WINDOWS_STATUS_HUM_SENSOR_FAULT (1U << 11)
 #define WINDOWS_STATUS_ALGO_HUMIDITY (1U << 12)
+#define WINDOWS_STATUS_REACTION_HOLD (1U << 13)
 
 #define WEATHER_STATUS_LAST_ERROR (1U << 15)
 
@@ -239,7 +240,7 @@ typedef struct {
 
 typedef struct {
   bool active;
-  float dynamic_max_percent;
+  float reduction_percent;
 } window_wind_cap_t;
 
 typedef struct {
@@ -275,6 +276,7 @@ typedef struct {
   window_wind_role_settings_t leeward;
   float windward_lag_percent;
   float rain_windward_percent;
+  uint32_t reaction_delay_ms;
   float target_hyst_percent;
   float motion_delta_percent;
   uint32_t no_motion_timeout_ms;
@@ -288,6 +290,10 @@ typedef struct {
   bool wind_limit_a_active;
   bool wind_limit_b_active;
   bool effective_target_initialized;
+  bool reaction_pending;
+  float pending_effective_target_a_percent;
+  float pending_effective_target_b_percent;
+  uint32_t reaction_started_ms;
   float last_effective_target_a_percent;
   float last_effective_target_b_percent;
   window_wind_speed_hold_t windward_speed_hold;
@@ -343,6 +349,10 @@ static app_sensor_snapshot_t s_sensor_snapshot = {0};
 static window_pair_runtime_t s_window_runtime = {0};
 static heating_runtime_t s_heating_runtime = {0};
 
+static uint32_t app_now_ms(void) {
+  return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
 static float clampf_local(float value, float min_value, float max_value) {
   if (value < min_value) {
     return min_value;
@@ -376,6 +386,66 @@ static float stabilize_effective_target(float requested_percent,
     return requested_percent;
   }
   return previous_percent;
+}
+
+static bool target_pair_matches(float lhs_a_percent, float lhs_b_percent,
+                                float rhs_a_percent, float rhs_b_percent) {
+  return fabsf(lhs_a_percent - rhs_a_percent) < 0.05f &&
+         fabsf(lhs_b_percent - rhs_b_percent) < 0.05f;
+}
+
+static bool apply_window_reaction_delay(window_pair_runtime_t *runtime,
+                                        float *target_a_percent,
+                                        float *target_b_percent,
+                                        uint32_t delay_ms,
+                                        bool force_update) {
+  if (runtime == NULL || target_a_percent == NULL || target_b_percent == NULL) {
+    return false;
+  }
+
+  if (force_update || delay_ms == 0U) {
+    runtime->reaction_pending = false;
+    runtime->last_effective_target_a_percent = *target_a_percent;
+    runtime->last_effective_target_b_percent = *target_b_percent;
+    return false;
+  }
+
+  const float requested_a = *target_a_percent;
+  const float requested_b = *target_b_percent;
+  const float current_a = runtime->last_effective_target_a_percent;
+  const float current_b = runtime->last_effective_target_b_percent;
+
+  if (target_pair_matches(requested_a, requested_b, current_a, current_b)) {
+    runtime->reaction_pending = false;
+    return false;
+  }
+
+  const bool same_pending =
+      runtime->reaction_pending &&
+      target_pair_matches(requested_a, requested_b,
+                          runtime->pending_effective_target_a_percent,
+                          runtime->pending_effective_target_b_percent);
+  const uint32_t now = app_now_ms();
+  if (!same_pending) {
+    runtime->reaction_pending = true;
+    runtime->pending_effective_target_a_percent = requested_a;
+    runtime->pending_effective_target_b_percent = requested_b;
+    runtime->reaction_started_ms = now;
+    *target_a_percent = current_a;
+    *target_b_percent = current_b;
+    return true;
+  }
+
+  if ((uint32_t)(now - runtime->reaction_started_ms) < delay_ms) {
+    *target_a_percent = current_a;
+    *target_b_percent = current_b;
+    return true;
+  }
+
+  runtime->reaction_pending = false;
+  runtime->last_effective_target_a_percent = requested_a;
+  runtime->last_effective_target_b_percent = requested_b;
+  return false;
 }
 
 static uint32_t sanitize_timeout_or_default(uint32_t value, uint32_t default_value) {
@@ -599,6 +669,7 @@ static void read_window_settings(window_settings_t *settings) {
       clampf_local(modbus_get_windows_windward_lag_percent(), 0.0f, 100.0f);
   settings->rain_windward_percent = clampf_local(
       modbus_get_windows_rain_windward_percent(), 0.0f, 100.0f);
+  settings->reaction_delay_ms = modbus_get_windows_reaction_delay_ms();
   settings->target_hyst_percent = sanitize_positive_or_default(
       modbus_get_rll400_target_hysteresis_percent(),
       WINDOWS_TARGET_HYST_DEFAULT_PERCENT);
@@ -618,6 +689,8 @@ static void read_window_settings(window_settings_t *settings) {
   settings->weather_source_age_limit_s =
       (uint16_t)clampf_local((float)settings->weather_source_age_limit_s, 1.0f,
                              600.0f);
+  settings->reaction_delay_ms =
+      (uint32_t)clampf_local((float)settings->reaction_delay_ms, 0.0f, 60000.0f);
   settings->temp_step_target_percent =
       clampf_local(settings->temp_step_target_percent, 0.1f, 100.0f);
   settings->humidity_step_target_percent =
@@ -708,13 +781,12 @@ calculate_wind_cap(float wind_speed_ms,
                    window_wind_speed_hold_t *speed_hold) {
   window_wind_cap_t cap = {
       .active = false,
-      .dynamic_max_percent = 100.0f,
+      .reduction_percent = 0.0f,
   };
   if (role_settings == NULL || !isfinite(wind_speed_ms)) {
     return cap;
   }
 
-  cap.dynamic_max_percent = role_settings->max_percent;
   const float calculation_wind_speed_ms = stabilize_wind_speed_for_target(
       wind_speed_ms, role_settings->speed_threshold_ms, speed_hold);
   if (calculation_wind_speed_ms < role_settings->speed_threshold_ms) {
@@ -728,49 +800,59 @@ calculate_wind_cap(float wind_speed_ms,
   }
 
   cap.active = true;
-  cap.dynamic_max_percent =
-      role_settings->max_percent -
-      (excess_ms * role_settings->reduction_percent_per_ms);
-  cap.dynamic_max_percent =
-      clampf_local(cap.dynamic_max_percent, role_settings->min_percent,
-                   role_settings->max_percent);
+  cap.reduction_percent = excess_ms * role_settings->reduction_percent_per_ms;
+  cap.reduction_percent = fmaxf(cap.reduction_percent, 0.0f);
   return cap;
 }
 
 static float apply_leeward_wind_cap(
     float target_percent, const window_wind_role_settings_t *role_settings,
     const window_wind_cap_t *cap) {
-  if (role_settings == NULL || cap == NULL || !cap->active) {
+  if (role_settings == NULL) {
     return target_percent;
   }
 
-  const float max_percent = fmaxf(cap->dynamic_max_percent,
-                                  role_settings->min_percent);
-  return clampf_local(fminf(target_percent, max_percent),
-                      role_settings->min_percent, max_percent);
+  const float allowed_target_percent =
+      clampf_local(target_percent, role_settings->min_percent,
+                   role_settings->max_percent);
+  if (cap == NULL || !cap->active) {
+    return allowed_target_percent;
+  }
+
+  const float wind_target_percent =
+      allowed_target_percent - cap->reduction_percent;
+  return clampf_local(wind_target_percent, role_settings->min_percent,
+                      role_settings->max_percent);
 }
 
 static float apply_windward_wind_cap(
     float target_percent, const window_wind_role_settings_t *role_settings,
     const window_wind_cap_t *cap, float leeward_target_percent,
     float lag_percent) {
-  if (role_settings == NULL || cap == NULL || !cap->active) {
+  if (role_settings == NULL) {
     return target_percent;
   }
 
-  float max_percent = fminf(cap->dynamic_max_percent,
-                            leeward_target_percent - lag_percent);
+  float max_percent = role_settings->max_percent;
+  if (cap != NULL && cap->active) {
+    max_percent = fminf(max_percent, leeward_target_percent - lag_percent);
+  }
   max_percent = fmaxf(max_percent, role_settings->min_percent);
-  max_percent = fminf(max_percent, role_settings->max_percent);
-  return clampf_local(fminf(target_percent, max_percent),
-                      role_settings->min_percent, max_percent);
+  const float allowed_target_percent =
+      clampf_local(target_percent, role_settings->min_percent, max_percent);
+  if (cap == NULL || !cap->active) {
+    return allowed_target_percent;
+  }
+
+  const float wind_target_percent =
+      allowed_target_percent - cap->reduction_percent;
+  return clampf_local(wind_target_percent, role_settings->min_percent,
+                      max_percent);
 }
 
-static float apply_rain_cap(float target_percent, float rain_cap_percent,
-                            float min_percent) {
-  const float max_percent = fmaxf(rain_cap_percent, min_percent);
-  return clampf_local(fminf(target_percent, max_percent), min_percent,
-                      max_percent);
+static float apply_rain_cap(float target_percent, float rain_cap_percent) {
+  const float max_percent = clampf_local(rain_cap_percent, 0.0f, 100.0f);
+  return clampf_local(fminf(target_percent, max_percent), 0.0f, max_percent);
 }
 
 static modbus_windows_windward_side_t
@@ -1325,29 +1407,29 @@ static void process_windows(const app_sensor_snapshot_t *sensor_snapshot,
                              &s_window_runtime.leeward_speed_hold);
 
       if (windward_side == MODBUS_WINDOWS_WINDWARD_SIDE_A) {
+        final_target_b =
+            apply_leeward_wind_cap(final_target_b, &settings.leeward,
+                                    &leeward_cap);
         if (leeward_cap.active) {
-          final_target_b =
-              apply_leeward_wind_cap(final_target_b, &settings.leeward,
-                                      &leeward_cap);
           s_window_runtime.wind_limit_b_active = true;
         }
+        final_target_a = apply_windward_wind_cap(
+            final_target_a, &settings.windward, &windward_cap, final_target_b,
+            settings.windward_lag_percent);
         if (windward_cap.active) {
-          final_target_a = apply_windward_wind_cap(
-              final_target_a, &settings.windward, &windward_cap, final_target_b,
-              settings.windward_lag_percent);
           s_window_runtime.wind_limit_a_active = true;
         }
       } else if (windward_side == MODBUS_WINDOWS_WINDWARD_SIDE_B) {
+        final_target_a =
+            apply_leeward_wind_cap(final_target_a, &settings.leeward,
+                                    &leeward_cap);
         if (leeward_cap.active) {
-          final_target_a =
-              apply_leeward_wind_cap(final_target_a, &settings.leeward,
-                                      &leeward_cap);
           s_window_runtime.wind_limit_a_active = true;
         }
+        final_target_b = apply_windward_wind_cap(
+            final_target_b, &settings.windward, &windward_cap, final_target_a,
+            settings.windward_lag_percent);
         if (windward_cap.active) {
-          final_target_b = apply_windward_wind_cap(
-              final_target_b, &settings.windward, &windward_cap, final_target_a,
-              settings.windward_lag_percent);
           s_window_runtime.wind_limit_b_active = true;
         }
       }
@@ -1356,23 +1438,19 @@ static void process_windows(const app_sensor_snapshot_t *sensor_snapshot,
     if (!weather_stale && weather.rain_active &&
         settings.rain_mode == MODBUS_WINDOWS_RAIN_MODE_WINDWARD) {
       if (windward_side == MODBUS_WINDOWS_WINDWARD_SIDE_A) {
-        final_target_a = apply_rain_cap(final_target_a,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
+        final_target_a =
+            apply_rain_cap(final_target_a, settings.rain_windward_percent);
         rain_limit_a_active = true;
       } else if (windward_side == MODBUS_WINDOWS_WINDWARD_SIDE_B) {
-        final_target_b = apply_rain_cap(final_target_b,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
+        final_target_b =
+            apply_rain_cap(final_target_b, settings.rain_windward_percent);
         rain_limit_b_active = true;
       } else {
         windward_side = MODBUS_WINDOWS_WINDWARD_SIDE_BOTH_UNKNOWN;
-        final_target_a = apply_rain_cap(final_target_a,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
-        final_target_b = apply_rain_cap(final_target_b,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
+        final_target_a =
+            apply_rain_cap(final_target_a, settings.rain_windward_percent);
+        final_target_b =
+            apply_rain_cap(final_target_b, settings.rain_windward_percent);
         rain_limit_a_active = true;
         rain_limit_b_active = true;
       }
@@ -1414,19 +1492,26 @@ static void process_windows(const app_sensor_snapshot_t *sensor_snapshot,
   const bool hard_safety_active =
       force_safe_active || s_window_runtime.cold_close_active ||
       weather_safe_active || s_window_runtime.storm_active;
+  bool reaction_hold_active = false;
   if (!s_window_runtime.effective_target_initialized) {
     s_window_runtime.last_effective_target_a_percent = final_target_a;
     s_window_runtime.last_effective_target_b_percent = final_target_b;
+    s_window_runtime.reaction_pending = false;
     s_window_runtime.effective_target_initialized = true;
   } else {
     final_target_a = stabilize_effective_target(
         final_target_a, s_window_runtime.last_effective_target_a_percent,
-        settings.target_hyst_percent, hard_safety_active || rain_limit_a_active);
+        settings.target_hyst_percent,
+        hard_safety_active || rain_limit_a_active ||
+            s_window_runtime.wind_limit_a_active);
     final_target_b = stabilize_effective_target(
         final_target_b, s_window_runtime.last_effective_target_b_percent,
-        settings.target_hyst_percent, hard_safety_active || rain_limit_b_active);
-    s_window_runtime.last_effective_target_a_percent = final_target_a;
-    s_window_runtime.last_effective_target_b_percent = final_target_b;
+        settings.target_hyst_percent,
+        hard_safety_active || rain_limit_b_active ||
+            s_window_runtime.wind_limit_b_active);
+    reaction_hold_active = apply_window_reaction_delay(
+        &s_window_runtime, &final_target_a, &final_target_b,
+        settings.reaction_delay_ms, hard_safety_active);
   }
 
   (void)rll400_set_target(s_window_a_handle, final_target_a);
@@ -1475,6 +1560,9 @@ static void process_windows(const app_sensor_snapshot_t *sensor_snapshot,
   }
   if (humidity_algorithm) {
     windows_status_bits |= WINDOWS_STATUS_ALGO_HUMIDITY;
+  }
+  if (reaction_hold_active) {
+    windows_status_bits |= WINDOWS_STATUS_REACTION_HOLD;
   }
 
   modbus_set_windows_runtime(

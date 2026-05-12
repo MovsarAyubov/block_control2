@@ -83,6 +83,7 @@ static const char *TAG = "MB_SLAVE";
   MODBUS_WINDOWS_WEATHER_STALE_CLOSE_SAFE
 #define MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_TIMEOUT_MS 20000U
 #define MODBUS_WINDOWS_DEFAULT_WEATHER_SOURCE_AGE_S 20U
+#define MODBUS_WINDOWS_DEFAULT_REACTION_DELAY_MS 0U
 #define MODBUS_WINDOWS_DEFAULT_TARGET_HYST_PERCENT 30U
 #define MODBUS_WINDOWS_DEFAULT_MOTION_DELTA_PERCENT 5U
 #define MODBUS_WINDOWS_DEFAULT_NO_MOTION_TIMEOUT_MS 3000U
@@ -1619,7 +1620,9 @@ static bool reg_span_intersects_window_settings(uint16_t start_reg,
                              MODBUS_HREG_WINDOWS_WEATHER_STALE_POLICY) ||
          reg_span_intersects(start_reg, reg_count,
                              MODBUS_HREG_WINDOWS_TEMP_STEP_TARGET_PERCENT,
-                             MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S);
+                             MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S) ||
+         reg_span_contains(start_reg, reg_count,
+                           MODBUS_HREG_WINDOWS_REACTION_DELAY_MS);
 }
 
 static bool write_span_intersects_window_settings(bool has_span,
@@ -1701,6 +1704,8 @@ static void log_window_settings_received(uint16_t start_reg,
       s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS];
   const uint16_t source_age =
       s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S];
+  const uint16_t reaction_delay =
+      s_holding_regs[MODBUS_HREG_WINDOWS_REACTION_DELAY_MS];
   const uint16_t target_hyst =
       s_holding_regs[MODBUS_HREG_RLL400_TARGET_HYST_PERCENT];
   const uint16_t motion_delta =
@@ -1730,6 +1735,7 @@ static void log_window_settings_received(uint16_t start_reg,
            "max=%.1f%% thr=%.1fm/s reduce=%.1f%%/m/s] leeward[min=%.1f%% "
            "max=%.1f%% thr=%.1fm/s reduce=%.1f%%/m/s] lag=%.1f%% "
            "rain[mode=%u pos=%.1f%%] stale[policy=%u timeout=%ums age=%us] "
+           "reaction=%ums "
            "rll400[hyst=%.1f%% motion=%.1f%% timeout=%ums]",
            ((float)safe_min) / 10.0f, ((float)storm) / 10.0f,
            ((float)recover) / 10.0f, (unsigned)azimuth, (unsigned)sector,
@@ -1740,6 +1746,7 @@ static void log_window_settings_received(uint16_t start_reg,
            ((float)wind_lag) / 10.0f, (unsigned)rain_mode,
            ((float)rain_pos) / 10.0f, (unsigned)stale_policy,
            (unsigned)stale_timeout, (unsigned)source_age,
+           (unsigned)reaction_delay,
            ((float)target_hyst) / 10.0f, ((float)motion_delta) / 10.0f,
            (unsigned)no_motion);
 }
@@ -2341,6 +2348,8 @@ void modbus_init(void) {
       MODBUS_WINDOWS_DEFAULT_WEATHER_STALE_TIMEOUT_MS;
   s_holding_regs[MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S] =
       MODBUS_WINDOWS_DEFAULT_WEATHER_SOURCE_AGE_S;
+  s_holding_regs[MODBUS_HREG_WINDOWS_REACTION_DELAY_MS] =
+      MODBUS_WINDOWS_DEFAULT_REACTION_DELAY_MS;
   s_holding_regs[MODBUS_HREG_WINDOWS_BASE_TARGET_A] = 0U;
   s_holding_regs[MODBUS_HREG_WINDOWS_BASE_TARGET_B] = 0U;
   s_holding_regs[MODBUS_HREG_WINDOWS_EFFECTIVE_TARGET_A] = 0U;
@@ -3547,7 +3556,8 @@ static esp_err_t handle_ascii_window_settings_alias_command(
     return ESP_OK;
   }
 
-  if (strcmp(name, "wx_stale_ms") == 0 || strcmp(name, "wx_age_max") == 0) {
+  if (strcmp(name, "wx_stale_ms") == 0 || strcmp(name, "wx_age_max") == 0 ||
+      strcmp(name, "win_react_ms") == 0) {
     uint16_t raw_value = 0U;
     uint16_t max_value = UINT16_MAX;
     uint16_t reg = 0U;
@@ -3555,9 +3565,12 @@ static esp_err_t handle_ascii_window_settings_alias_command(
     if (strcmp(name, "wx_stale_ms") == 0) {
       max_value = 60000U;
       reg = MODBUS_HREG_WINDOWS_WEATHER_STALE_TIMEOUT_MS;
-    } else {
+    } else if (strcmp(name, "wx_age_max") == 0) {
       max_value = 600U;
       reg = MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S;
+    } else {
+      max_value = 60000U;
+      reg = MODBUS_HREG_WINDOWS_REACTION_DELAY_MS;
     }
 
     if (!parse_u16_ascii(value, max_value, &raw_value)) {
@@ -4200,6 +4213,7 @@ esp_err_t modbus_handle_ascii_command(const char *line, char *response,
              "windward_min windward_max "
              "windward_thr windward_reduce leeward_min leeward_max leeward_thr "
              "leeward_reduce wind_lag rain_mode rain_pos wx_stale_ms wx_age_max "
+             "win_react_ms "
              "wx_temp wx_hum wx_wind wx_dir wx_rain wx_solar wx_baro wx_dew "
              "wx_age wx_stat air_temp air_rh sensor_override");
     return ESP_OK;
@@ -4463,6 +4477,11 @@ uint32_t modbus_get_windows_weather_stale_timeout_ms(void) {
 
 uint16_t modbus_get_windows_weather_source_age_limit_s(void) {
   return modbus_read_holding_reg(MODBUS_HREG_WINDOWS_WEATHER_SOURCE_AGE_S);
+}
+
+uint32_t modbus_get_windows_reaction_delay_ms(void) {
+  return (uint32_t)modbus_read_holding_reg(
+      MODBUS_HREG_WINDOWS_REACTION_DELAY_MS);
 }
 
 float modbus_get_rll400_target_hysteresis_percent(void) {

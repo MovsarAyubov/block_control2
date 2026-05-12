@@ -72,6 +72,7 @@ The primary Bluetooth interface uses short readable names.
 | `211` `WINDOWS_RAIN_WINDWARD_PERCENT` | `rain_pos` | `set rain_pos 0` |
 | `223` `WINDOWS_WEATHER_STALE_TIMEOUT_MS` | `wx_stale_ms` | `set wx_stale_ms 20000` |
 | `224` `WINDOWS_WEATHER_SOURCE_AGE_S` | `wx_age_max` | `set wx_age_max 20` |
+| `243` `WINDOWS_REACTION_DELAY_MS` | `win_react_ms` | `set win_react_ms 5000` |
 
 ### Not Used In Autonomous Bluetooth Control
 
@@ -159,6 +160,7 @@ tested without changing the real PT500/RH inputs.
 - `set rain_pos 0`
 - `set wx_stale_ms 20000`
 - `set wx_age_max 20`
+- `set win_react_ms 5000`
 - `set curt_pos 100`
 - `set sp_rail 35.0`
 - `set sp_grow 32.0`
@@ -194,6 +196,7 @@ Values:
 - Window automation percent values use `0..100`
 - `wx_stale_ms` is weather receive timeout in milliseconds, effective range `1000..60000`; `0` falls back to default
 - `wx_age_max` is maximum weather source age in seconds, effective range `1..600`; `0` falls back to default
+- `win_react_ms` is the window target reaction delay in milliseconds, effective range `0..60000`; `0` disables the delay
 - Wind thresholds are in `m/s`, valid range `0..100.0`
 - Wind reduction is in `% per m/s` above the role threshold
 - Wind reduction uses the normal `% per m/s` formula, but recalculates only

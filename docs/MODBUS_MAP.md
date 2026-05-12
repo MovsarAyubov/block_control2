@@ -195,7 +195,7 @@
 - `5` NOOP
 - `4` FAILED
 
-## Window Control, `171..224`
+## Window Control, `171..224`, `243`
 - `171` WINDOWS_CTRL_MODE: `0=AUTO`, `1=MANUAL`
 - `172` WINDOWS_FORCE_SAFE_CMD
 - `173` WINDOWS_TEMP_SETPOINT, `x10 C`
@@ -250,13 +250,14 @@
 - `221` WINDOWS_HUM_STEP_TARGET_PERCENT, `x10 %`
 - `222` WINDOWS_HUM_STEP_MAX_INDEX, legacy/reserved
 
-Wind reduction uses the normal formula
-`dynamic_max = max_percent - (wind_speed - threshold) * reduction`, but the wind
-speed used by that formula is held until the measured wind changes by at least
-`0.5 m/s`. This gives two target recalculations per `1 m/s` instead of reacting
-to every `0.1 m/s` update from the weather station.
+Wind reduction first clamps the calculated target to the side min/max, then
+subtracts `(wind_speed - threshold) * reduction`. The wind speed used by that
+formula is held until the measured wind changes by at least `0.5 m/s`.
 - `223` WINDOWS_WEATHER_STALE_TIMEOUT_MS
 - `224` WINDOWS_WEATHER_SOURCE_AGE_S
+- `243` WINDOWS_REACTION_DELAY_MS, default `0`; when non-zero, non-hard window
+  target changes must remain requested for this many milliseconds before being
+  sent to RLL400
 
 ## Heating Control, `225..242`
 - `225` HEATING_CTRL_MODE: `0=AUTO`, `1=OFF`, `2=MANUAL`
@@ -331,6 +332,12 @@ to every `0.1 m/s` update from the weather station.
 - `bit8` temperature sensor fault
 - `bit9` humidity sensor fault
 
+Rain limiting uses `211 WINDOWS_RAIN_WINDWARD_PERCENT` as an absolute cap and
+can close below `201/205` side minimums.
+
+### Window Status Bits (`187`)
+- `bit13` reaction delay is holding a pending target change
+
 Weather is treated as unsafe/stale by the window controller when the weather
 snapshot is missing, stale by age, or `WEATHER_STATUS_BITS bit15` is set.
 Normal station status bits such as `bit0=active` and `bit1=data valid` do not
@@ -375,6 +382,7 @@ trigger weather safe closing.
 - `212` WINDOWS_WEATHER_STALE_POLICY: `0=CLOSE_SAFE`, `1=IGNORE`
 - `223` WINDOWS_WEATHER_STALE_TIMEOUT_MS
 - `224` WINDOWS_WEATHER_SOURCE_AGE_S
+- `243` WINDOWS_REACTION_DELAY_MS
 
 ### Commissioning And Service
 - `182` RLL400_TARGET_HYST_PERCENT, `x10 %`; used as motor deadband and
