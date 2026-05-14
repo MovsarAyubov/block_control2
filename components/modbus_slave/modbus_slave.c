@@ -95,6 +95,30 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_HEATING_DEFAULT_STAGE_DELTA_4 30U
 #define MODBUS_HEATING_DEFAULT_MIN_ON_S 60U
 #define MODBUS_HEATING_DEFAULT_MIN_OFF_S 30U
+#define MODBUS_CURTAIN_DEFAULT_CTRL_MODE MODBUS_CURTAIN_CTRL_MODE_MANUAL
+#define MODBUS_CURTAIN_DEFAULT_MANUAL_TARGET 1000U
+#define MODBUS_CURTAIN_DEFAULT_SCHEDULE_START_HHMM 600U
+#define MODBUS_CURTAIN_DEFAULT_SCHEDULE_END_HHMM 2200U
+#define MODBUS_CURTAIN_DEFAULT_OUTSIDE_TARGET 1000U
+#define MODBUS_CURTAIN_DEFAULT_MIN_POSITION 0U
+#define MODBUS_CURTAIN_DEFAULT_MAX_POSITION 1000U
+#define MODBUS_CURTAIN_DEFAULT_POSITION_HYST 30U
+#define MODBUS_CURTAIN_DEFAULT_RADIATION_THRESHOLD 500U
+#define MODBUS_CURTAIN_DEFAULT_RADIATION_STEP_WM2 100U
+#define MODBUS_CURTAIN_DEFAULT_RADIATION_STEP_PERCENT 100U
+#define MODBUS_CURTAIN_DEFAULT_RADIATION_HYST 50U
+#define MODBUS_CURTAIN_DEFAULT_COLD_DELTA 20U
+#define MODBUS_CURTAIN_DEFAULT_COLD_HYST 5U
+#define MODBUS_CURTAIN_DEFAULT_COLD_TARGET 0U
+#define MODBUS_CURTAIN_DEFAULT_HEAT_DELTA 20U
+#define MODBUS_CURTAIN_DEFAULT_HEAT_HYST 5U
+#define MODBUS_CURTAIN_DEFAULT_HEAT_TARGET 1000U
+#define MODBUS_CURTAIN_DEFAULT_HUM_LOW_THRESHOLD 380U
+#define MODBUS_CURTAIN_DEFAULT_HUM_LOW_HYST 20U
+#define MODBUS_CURTAIN_DEFAULT_HUM_LOW_TARGET 1000U
+#define MODBUS_CURTAIN_DEFAULT_HUM_HIGH_THRESHOLD 80U
+#define MODBUS_CURTAIN_DEFAULT_HUM_HIGH_HYST 20U
+#define MODBUS_CURTAIN_DEFAULT_HUM_HIGH_TARGET 0U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -354,6 +378,12 @@ static bool write_span_intersects_window_settings(bool has_span,
                                                   uint16_t reg_count);
 static void log_window_settings_received(uint16_t start_reg,
                                          uint16_t reg_count);
+static bool write_span_intersects_curtain_settings(bool has_span,
+                                                   uint16_t start_reg,
+                                                   uint16_t alt_start_reg,
+                                                   uint16_t reg_count);
+static void log_curtain_settings_received(uint16_t start_reg,
+                                          uint16_t reg_count);
 static uint8_t get_active_light_schedule_mask(const light_control_cfg_t *cfg,
                                                uint16_t minute_of_day);
 static void log_active_light_schedules_if_changed(
@@ -1631,6 +1661,38 @@ static bool write_span_intersects_window_settings(bool has_span,
           reg_span_intersects_window_settings(alt_start_reg, reg_count));
 }
 
+static bool write_span_intersects_greenhouse_targets(bool has_span,
+                                                     uint16_t start_reg,
+                                                     uint16_t alt_start_reg,
+                                                     uint16_t reg_count) {
+  return has_span &&
+         (reg_span_intersects(start_reg, reg_count,
+                              MODBUS_HREG_AIR_TEMP_TARGET,
+                              MODBUS_HREG_AIR_HUM_TARGET) ||
+          reg_span_intersects(alt_start_reg, reg_count,
+                              MODBUS_HREG_AIR_TEMP_TARGET,
+                              MODBUS_HREG_AIR_HUM_TARGET));
+}
+
+static void log_greenhouse_targets_received(uint16_t start_reg,
+                                            uint16_t reg_count) {
+  if (s_mbc_slave_handler == NULL) {
+    return;
+  }
+
+  ESP_ERROR_CHECK(mbc_slave_lock(s_mbc_slave_handler));
+  const uint16_t air_temp_target = s_holding_regs[MODBUS_HREG_AIR_TEMP_TARGET];
+  const uint16_t air_hum_target = s_holding_regs[MODBUS_HREG_AIR_HUM_TARGET];
+  ESP_ERROR_CHECK(mbc_slave_unlock(s_mbc_slave_handler));
+
+  ESP_LOGI(TAG,
+           "Greenhouse targets received from master: span=%u..%u "
+           "air_temp_target=%.1fC air_hum_target=%.1f%%",
+           (unsigned)start_reg, (unsigned)(start_reg + reg_count - 1U),
+           ((float)air_temp_target) / 10.0f,
+           ((float)air_hum_target) / 10.0f);
+}
+
 static void log_window_settings_received(uint16_t start_reg,
                                          uint16_t reg_count) {
   if (s_mbc_slave_handler == NULL) {
@@ -1742,6 +1804,74 @@ static void log_window_settings_received(uint16_t start_reg,
            (unsigned)stale_timeout, (unsigned)source_age,
            ((float)target_hyst) / 10.0f, ((float)motion_delta) / 10.0f,
            (unsigned)no_motion);
+}
+
+static bool write_span_intersects_curtain_settings(bool has_span,
+                                                   uint16_t start_reg,
+                                                   uint16_t alt_start_reg,
+                                                   uint16_t reg_count) {
+  return has_span &&
+         (reg_span_intersects(start_reg, reg_count,
+                              MODBUS_HREG_CURTAIN_POS_TARGET,
+                              MODBUS_HREG_CURTAIN_POS_TARGET) ||
+          reg_span_intersects(alt_start_reg, reg_count,
+                              MODBUS_HREG_CURTAIN_POS_TARGET,
+                              MODBUS_HREG_CURTAIN_POS_TARGET) ||
+          reg_span_intersects(start_reg, reg_count,
+                              MODBUS_HREG_CURTAIN_CTRL_MODE,
+                              MODBUS_HREG_CURTAIN_FAULT_RESET_TOKEN) ||
+          reg_span_intersects(alt_start_reg, reg_count,
+                              MODBUS_HREG_CURTAIN_CTRL_MODE,
+                              MODBUS_HREG_CURTAIN_FAULT_RESET_TOKEN));
+}
+
+static void log_curtain_settings_received(uint16_t start_reg,
+                                          uint16_t reg_count) {
+  const modbus_curtain_ctrl_mode_t mode = modbus_get_curtain_ctrl_mode();
+  const char *mode_text = "MANUAL";
+  if (mode == MODBUS_CURTAIN_CTRL_MODE_AUTO) {
+    mode_text = "AUTO";
+  } else if (mode == MODBUS_CURTAIN_CTRL_MODE_OFF) {
+    mode_text = "OFF";
+  }
+
+  ESP_LOGI(TAG,
+           "Curtain settings received from master: span=%u..%u mode=%s "
+           "requested=%.1f%% manual=%.1f%% schedule=%04u..%04u "
+           "limits[min=%.1f%% max=%.1f%% hyst=%.1f%% outside=%.1f%%]",
+           (unsigned)start_reg,
+           (unsigned)(start_reg + reg_count - 1U), mode_text,
+           modbus_get_curtain_target_percent(),
+           modbus_get_curtain_manual_target_percent(),
+           (unsigned)modbus_get_curtain_schedule_start_hhmm(),
+           (unsigned)modbus_get_curtain_schedule_end_hhmm(),
+           modbus_get_curtain_min_position_percent(),
+           modbus_get_curtain_max_position_percent(),
+           modbus_get_curtain_position_hysteresis_percent(),
+           modbus_get_curtain_outside_target_percent());
+  ESP_LOGI(TAG,
+           "Curtain auto rules received from master: radiation[thr=%uW/m2 "
+           "step=%uW/m2 open=%.1f%% hyst=%uW/m2] cold[delta=%.1fC "
+           "hyst=%.1fC target=%.1f%%] heat[delta=%.1fC hyst=%.1fC "
+           "target=%.1f%%] hum_low[delta=%.1f%% hyst=%.1f%% target=%.1f%%] "
+           "hum_high[delta=%.1f%% hyst=%.1f%% target=%.1f%%] reset_token=%u",
+           (unsigned)modbus_get_curtain_radiation_threshold_wm2(),
+           (unsigned)modbus_get_curtain_radiation_step_wm2(),
+           modbus_get_curtain_radiation_step_percent(),
+           (unsigned)modbus_get_curtain_radiation_hysteresis_wm2(),
+           modbus_get_curtain_cold_delta_c(),
+           modbus_get_curtain_cold_hysteresis_c(),
+           modbus_get_curtain_cold_target_percent(),
+           modbus_get_curtain_heat_delta_c(),
+           modbus_get_curtain_heat_hysteresis_c(),
+           modbus_get_curtain_heat_target_percent(),
+           modbus_get_curtain_humidity_low_threshold_percent(),
+           modbus_get_curtain_humidity_low_hysteresis_percent(),
+           modbus_get_curtain_humidity_low_target_percent(),
+           modbus_get_curtain_humidity_high_threshold_percent(),
+           modbus_get_curtain_humidity_high_hysteresis_percent(),
+           modbus_get_curtain_humidity_high_target_percent(),
+           (unsigned)modbus_get_curtain_fault_reset_token());
 }
 
 static void sync_staging_schedule_from_current_regs(void) {
@@ -1873,11 +2003,21 @@ static mb_exception_t modbus_fc_06_wrapper(void *ctx, uint8_t *frame,
                            MODBUS_HREG_WEATHER_SET_TOKEN));
   bool writes_window_settings = write_span_intersects_window_settings(
       has_span, start_reg, alt_start_reg, reg_count);
+  bool writes_curtain_settings = write_span_intersects_curtain_settings(
+      has_span, start_reg, alt_start_reg, reg_count);
+  bool writes_greenhouse_targets = write_span_intersects_greenhouse_targets(
+      has_span, start_reg, alt_start_reg, reg_count);
 
   mb_exception_t ex = invoke_wrapped_handler(0x06, ctx, frame, len_buf);
   if (ex == 0) {
+    if (writes_greenhouse_targets) {
+      log_greenhouse_targets_received(start_reg, reg_count);
+    }
     if (writes_window_settings) {
       log_window_settings_received(start_reg, reg_count);
+    }
+    if (writes_curtain_settings) {
+      log_curtain_settings_received(start_reg, reg_count);
     }
     queue_rtc_sync_request_from_regs();
     if (writes_weather) {
@@ -1924,11 +2064,21 @@ static mb_exception_t modbus_fc_10_wrapper(void *ctx, uint8_t *frame,
                            MODBUS_HREG_WEATHER_SET_TOKEN));
   bool writes_window_settings = write_span_intersects_window_settings(
       has_span, start_reg, alt_start_reg, reg_count);
+  bool writes_curtain_settings = write_span_intersects_curtain_settings(
+      has_span, start_reg, alt_start_reg, reg_count);
+  bool writes_greenhouse_targets = write_span_intersects_greenhouse_targets(
+      has_span, start_reg, alt_start_reg, reg_count);
 
   mb_exception_t ex = invoke_wrapped_handler(0x10, ctx, frame, len_buf);
   if (ex == 0) {
+    if (writes_greenhouse_targets) {
+      log_greenhouse_targets_received(start_reg, reg_count);
+    }
     if (writes_window_settings) {
       log_window_settings_received(start_reg, reg_count);
+    }
+    if (writes_curtain_settings) {
+      log_curtain_settings_received(start_reg, reg_count);
     }
     queue_rtc_sync_request_from_regs();
     if (writes_weather) {
@@ -1975,11 +2125,21 @@ static mb_exception_t modbus_fc_17_wrapper(void *ctx, uint8_t *frame,
                            MODBUS_HREG_WEATHER_SET_TOKEN));
   bool writes_window_settings = write_span_intersects_window_settings(
       has_span, start_reg, alt_start_reg, reg_count);
+  bool writes_curtain_settings = write_span_intersects_curtain_settings(
+      has_span, start_reg, alt_start_reg, reg_count);
+  bool writes_greenhouse_targets = write_span_intersects_greenhouse_targets(
+      has_span, start_reg, alt_start_reg, reg_count);
 
   mb_exception_t ex = invoke_wrapped_handler(0x17, ctx, frame, len_buf);
   if (ex == 0) {
+    if (writes_greenhouse_targets) {
+      log_greenhouse_targets_received(start_reg, reg_count);
+    }
     if (writes_window_settings) {
       log_window_settings_received(start_reg, reg_count);
+    }
+    if (writes_curtain_settings) {
+      log_curtain_settings_received(start_reg, reg_count);
     }
     queue_rtc_sync_request_from_regs();
     if (writes_weather) {
@@ -2375,6 +2535,66 @@ void modbus_init(void) {
   s_holding_regs[MODBUS_HREG_HEATING_VALVE_OPEN_MASK] = 0U;
   s_holding_regs[MODBUS_HREG_HEATING_VALVE_CLOSE_MASK] = 0U;
   s_holding_regs[MODBUS_HREG_HEATING_SENSOR_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_CTRL_MODE] =
+      MODBUS_CURTAIN_DEFAULT_CTRL_MODE;
+  s_holding_regs[MODBUS_HREG_CURTAIN_MANUAL_TARGET] =
+      MODBUS_CURTAIN_DEFAULT_MANUAL_TARGET;
+  s_holding_regs[MODBUS_HREG_CURTAIN_SCHEDULE_START_HHMM] =
+      MODBUS_CURTAIN_DEFAULT_SCHEDULE_START_HHMM;
+  s_holding_regs[MODBUS_HREG_CURTAIN_SCHEDULE_END_HHMM] =
+      MODBUS_CURTAIN_DEFAULT_SCHEDULE_END_HHMM;
+  s_holding_regs[MODBUS_HREG_CURTAIN_OUTSIDE_TARGET] =
+      MODBUS_CURTAIN_DEFAULT_OUTSIDE_TARGET;
+  s_holding_regs[MODBUS_HREG_CURTAIN_MIN_POSITION] =
+      MODBUS_CURTAIN_DEFAULT_MIN_POSITION;
+  s_holding_regs[MODBUS_HREG_CURTAIN_MAX_POSITION] =
+      MODBUS_CURTAIN_DEFAULT_MAX_POSITION;
+  s_holding_regs[MODBUS_HREG_CURTAIN_POSITION_HYST] =
+      MODBUS_CURTAIN_DEFAULT_POSITION_HYST;
+  s_holding_regs[MODBUS_HREG_CURTAIN_RADIATION_THRESHOLD] =
+      MODBUS_CURTAIN_DEFAULT_RADIATION_THRESHOLD;
+  s_holding_regs[MODBUS_HREG_CURTAIN_RADIATION_STEP_WM2] =
+      MODBUS_CURTAIN_DEFAULT_RADIATION_STEP_WM2;
+  s_holding_regs[MODBUS_HREG_CURTAIN_RADIATION_STEP_PERCENT] =
+      MODBUS_CURTAIN_DEFAULT_RADIATION_STEP_PERCENT;
+  s_holding_regs[MODBUS_HREG_CURTAIN_RADIATION_HYST] =
+      MODBUS_CURTAIN_DEFAULT_RADIATION_HYST;
+  s_holding_regs[MODBUS_HREG_CURTAIN_COLD_DELTA] =
+      MODBUS_CURTAIN_DEFAULT_COLD_DELTA;
+  s_holding_regs[MODBUS_HREG_CURTAIN_COLD_HYST] =
+      MODBUS_CURTAIN_DEFAULT_COLD_HYST;
+  s_holding_regs[MODBUS_HREG_CURTAIN_COLD_TARGET] =
+      MODBUS_CURTAIN_DEFAULT_COLD_TARGET;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HEAT_DELTA] =
+      MODBUS_CURTAIN_DEFAULT_HEAT_DELTA;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HEAT_HYST] =
+      MODBUS_CURTAIN_DEFAULT_HEAT_HYST;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HEAT_TARGET] =
+      MODBUS_CURTAIN_DEFAULT_HEAT_TARGET;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HUM_LOW_THRESHOLD] =
+      MODBUS_CURTAIN_DEFAULT_HUM_LOW_THRESHOLD;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HUM_LOW_HYST] =
+      MODBUS_CURTAIN_DEFAULT_HUM_LOW_HYST;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HUM_LOW_TARGET] =
+      MODBUS_CURTAIN_DEFAULT_HUM_LOW_TARGET;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HUM_HIGH_THRESHOLD] =
+      MODBUS_CURTAIN_DEFAULT_HUM_HIGH_THRESHOLD;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HUM_HIGH_HYST] =
+      MODBUS_CURTAIN_DEFAULT_HUM_HIGH_HYST;
+  s_holding_regs[MODBUS_HREG_CURTAIN_HUM_HIGH_TARGET] =
+      MODBUS_CURTAIN_DEFAULT_HUM_HIGH_TARGET;
+  s_holding_regs[MODBUS_HREG_CURTAIN_TARGET] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_BASE_TARGET] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_CURRENT_MA] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_REASON_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_POSITION_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_FAULT_CODE] = 0U;
+  s_holding_regs[MODBUS_HREG_CURTAIN_FAULT_RESET_TOKEN] = 0U;
+  s_holding_regs[MODBUS_HREG_AIR_TEMP_TARGET] =
+      MODBUS_WINDOWS_DEFAULT_TEMP_SETPOINT;
+  s_holding_regs[MODBUS_HREG_AIR_HUM_TARGET] =
+      MODBUS_WINDOWS_DEFAULT_HUM_SETPOINT;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_apply_pending = false;
@@ -3204,6 +3424,38 @@ static void format_windows_summary(char *response, size_t response_len) {
            (unsigned)modbus_read_holding_reg(MODBUS_HREG_WINDOW_B_FAULT_CODE));
 }
 
+static void format_curtain_summary(char *response, size_t response_len) {
+  if (response == NULL || response_len == 0U) {
+    return;
+  }
+
+  const modbus_curtain_ctrl_mode_t mode = modbus_get_curtain_ctrl_mode();
+  const char *mode_text = "MANUAL";
+  if (mode == MODBUS_CURTAIN_CTRL_MODE_AUTO) {
+    mode_text = "AUTO";
+  } else if (mode == MODBUS_CURTAIN_CTRL_MODE_OFF) {
+    mode_text = "OFF";
+  }
+
+  snprintf(response, response_len,
+           "OK curtain mode=%s requested=%.1f%% manual=%.1f%% target=%.1f%% "
+           "base=%.1f%% pos=%.1f%% current=%.1fmA status=0x%04X "
+           "reason=0x%04X pos_status=0x%04X fault=%u",
+           mode_text, modbus_get_curtain_target_percent(),
+           modbus_get_curtain_manual_target_percent(),
+           ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_TARGET)) / 10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_BASE_TARGET)) /
+               10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_POS)) / 10.0f,
+           ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_CURRENT_MA)) /
+               10.0f,
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_STATUS_BITS),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_REASON_BITS),
+           (unsigned)modbus_read_holding_reg(
+               MODBUS_HREG_CURTAIN_POSITION_STATUS_BITS),
+           (unsigned)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_FAULT_CODE));
+}
+
 static esp_err_t apply_ascii_weather_update(const weather_snapshot_t *snapshot,
                                             char *response, size_t response_len,
                                             const char *success_text) {
@@ -3896,6 +4148,11 @@ static esp_err_t handle_ascii_show_command(size_t token_count, char *tokens[],
     return ESP_OK;
   }
 
+  if (token_count == 1U && strcmp(tokens[0], "curtain") == 0) {
+    format_curtain_summary(response, response_len);
+    return ESP_OK;
+  }
+
   if (token_count == 2U && strcmp(tokens[0], "light") == 0) {
     size_t relay_index = 0U;
     if (!parse_light_relay_ascii(tokens[1], &relay_index)) {
@@ -4281,6 +4538,19 @@ float modbus_get_window_b_target_percent(void) {
       modbus_read_holding_reg(MODBUS_HREG_WINDOWS_POS_B_TARGET));
 }
 
+float modbus_get_curtain_target_percent(void) {
+  if (modbus_get_mode_state() == MODBUS_MODE_AUTONOMOUS) {
+    uint16_t raw_target = 0U;
+    taskENTER_CRITICAL(&s_state_lock);
+    raw_target = s_autonomous_cfg.curtain_pos_target;
+    taskEXIT_CRITICAL(&s_state_lock);
+    return modbus_raw_percent_to_float(raw_target);
+  }
+
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_POS_TARGET));
+}
+
 modbus_windows_ctrl_mode_t modbus_get_windows_ctrl_mode(void) {
   const uint16_t raw_mode = modbus_read_holding_reg(MODBUS_HREG_WINDOWS_CTRL_MODE);
   return (raw_mode == (uint16_t)MODBUS_WINDOWS_CTRL_MODE_MANUAL)
@@ -4292,8 +4562,13 @@ bool modbus_get_windows_force_safe_cmd(void) {
   return modbus_read_holding_reg(MODBUS_HREG_WINDOWS_FORCE_SAFE_CMD) != 0U;
 }
 
+float modbus_get_air_temp_target_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_AIR_TEMP_TARGET)) / 10.0f;
+}
+
 float modbus_get_windows_temp_setpoint_c(void) {
-  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_SETPOINT)) / 10.0f;
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_WINDOWS_TEMP_SETPOINT)) /
+         10.0f;
 }
 
 float modbus_get_windows_safe_min_percent(void) {
@@ -4351,6 +4626,11 @@ modbus_windows_auto_algo_mode_t modbus_get_windows_auto_algo_mode(void) {
   return (raw == (uint16_t)MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY)
              ? MODBUS_WINDOWS_AUTO_ALGO_HUMIDITY
              : MODBUS_WINDOWS_AUTO_ALGO_TEMP;
+}
+
+float modbus_get_air_hum_target_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_AIR_HUM_TARGET));
 }
 
 float modbus_get_windows_humidity_setpoint_percent(void) {
@@ -4507,6 +4787,7 @@ void modbus_get_weather_runtime(modbus_weather_runtime_t *out_runtime) {
   out_runtime->wind_dir_deg = (uint16_t)(snapshot.wind_dir % 360U);
   out_runtime->source_age_s = snapshot.source_age_s;
   out_runtime->status_bits = snapshot.status_bits;
+  out_runtime->solar_radiation_wm2 = (float)snapshot.solar_rad;
   out_runtime->valid = valid;
   out_runtime->stale = stale;
   out_runtime->rain_active = (snapshot.rain_flag != 0U);
@@ -4579,6 +4860,157 @@ void modbus_set_windows_target_diagnostics(
                            active_protection_bits);
   modbus_write_holding_reg(MODBUS_HREG_WINDOWS_WINDWARD_SIDE,
                            (uint16_t)windward_side);
+}
+
+modbus_curtain_ctrl_mode_t modbus_get_curtain_ctrl_mode(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_CURTAIN_CTRL_MODE);
+  if (raw == (uint16_t)MODBUS_CURTAIN_CTRL_MODE_AUTO) {
+    return MODBUS_CURTAIN_CTRL_MODE_AUTO;
+  }
+  if (raw == (uint16_t)MODBUS_CURTAIN_CTRL_MODE_OFF) {
+    return MODBUS_CURTAIN_CTRL_MODE_OFF;
+  }
+  return MODBUS_CURTAIN_CTRL_MODE_MANUAL;
+}
+
+float modbus_get_curtain_manual_target_percent(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_CURTAIN_MANUAL_TARGET);
+  if (raw != MODBUS_CURTAIN_DEFAULT_MANUAL_TARGET ||
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_POS_TARGET) ==
+          MODBUS_CURTAIN_DEFAULT_MANUAL_TARGET) {
+    return modbus_raw_percent_to_float(raw);
+  }
+  return modbus_get_curtain_target_percent();
+}
+
+uint16_t modbus_get_curtain_schedule_start_hhmm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CURTAIN_SCHEDULE_START_HHMM);
+}
+
+uint16_t modbus_get_curtain_schedule_end_hhmm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CURTAIN_SCHEDULE_END_HHMM);
+}
+
+float modbus_get_curtain_outside_target_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_OUTSIDE_TARGET));
+}
+
+float modbus_get_curtain_min_position_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_MIN_POSITION));
+}
+
+float modbus_get_curtain_max_position_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_MAX_POSITION));
+}
+
+float modbus_get_curtain_position_hysteresis_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_POSITION_HYST));
+}
+
+uint16_t modbus_get_curtain_radiation_threshold_wm2(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CURTAIN_RADIATION_THRESHOLD);
+}
+
+uint16_t modbus_get_curtain_radiation_step_wm2(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CURTAIN_RADIATION_STEP_WM2);
+}
+
+float modbus_get_curtain_radiation_step_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_RADIATION_STEP_PERCENT));
+}
+
+uint16_t modbus_get_curtain_radiation_hysteresis_wm2(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CURTAIN_RADIATION_HYST);
+}
+
+float modbus_get_curtain_cold_delta_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_COLD_DELTA)) /
+         10.0f;
+}
+
+float modbus_get_curtain_cold_hysteresis_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_COLD_HYST)) /
+         10.0f;
+}
+
+float modbus_get_curtain_cold_target_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_COLD_TARGET));
+}
+
+float modbus_get_curtain_heat_delta_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HEAT_DELTA)) /
+         10.0f;
+}
+
+float modbus_get_curtain_heat_hysteresis_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HEAT_HYST)) /
+         10.0f;
+}
+
+float modbus_get_curtain_heat_target_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HEAT_TARGET));
+}
+
+float modbus_get_curtain_humidity_low_threshold_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HUM_LOW_THRESHOLD));
+}
+
+float modbus_get_curtain_humidity_low_hysteresis_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HUM_LOW_HYST));
+}
+
+float modbus_get_curtain_humidity_low_target_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HUM_LOW_TARGET));
+}
+
+float modbus_get_curtain_humidity_high_threshold_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HUM_HIGH_THRESHOLD));
+}
+
+float modbus_get_curtain_humidity_high_hysteresis_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HUM_HIGH_HYST));
+}
+
+float modbus_get_curtain_humidity_high_target_percent(void) {
+  return modbus_raw_percent_to_float(
+      modbus_read_holding_reg(MODBUS_HREG_CURTAIN_HUM_HIGH_TARGET));
+}
+
+uint16_t modbus_get_curtain_fault_reset_token(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CURTAIN_FAULT_RESET_TOKEN);
+}
+
+void modbus_set_curtain_runtime(float target_percent, float base_target_percent,
+                                float current_ma, uint16_t status_bits,
+                                uint16_t reason_bits,
+                                uint16_t position_status_bits,
+                                uint16_t fault_code) {
+  modbus_write_holding_reg(
+      MODBUS_HREG_CURTAIN_TARGET,
+      float_to_u16_tenths(target_percent, 0.0f, 100.0f));
+  modbus_write_holding_reg(
+      MODBUS_HREG_CURTAIN_BASE_TARGET,
+      float_to_u16_tenths(base_target_percent, 0.0f, 100.0f));
+  modbus_write_holding_reg(
+      MODBUS_HREG_CURTAIN_CURRENT_MA,
+      float_to_u16_tenths(current_ma, 0.0f, 30.0f));
+  modbus_write_holding_reg(MODBUS_HREG_CURTAIN_STATUS_BITS, status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CURTAIN_REASON_BITS, reason_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CURTAIN_POSITION_STATUS_BITS,
+                           position_status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CURTAIN_FAULT_CODE, fault_code);
 }
 
 static uint16_t modbus_get_autonomous_water_setpoint_raw(

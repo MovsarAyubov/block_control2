@@ -2,6 +2,7 @@
 #include "driver/i2c.h"
 #include "esp_check.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <string.h>
 
@@ -23,6 +24,18 @@ typedef struct ads1115_context_t {
   ads1115_config_t config;
 } ads1115_context_t;
 
+static SemaphoreHandle_t s_ads1115_lock = NULL;
+
+static esp_err_t ads1115_lock_init(void) {
+  if (s_ads1115_lock == NULL) {
+    s_ads1115_lock = xSemaphoreCreateMutex();
+    if (s_ads1115_lock == NULL) {
+      return ESP_ERR_NO_MEM;
+    }
+  }
+  return ESP_OK;
+}
+
 static esp_err_t _write_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
                             uint16_t value) {
   // ESP_LOGD(TAG, "Write Reg: Addr 0x%02X, Reg 0x%02X, Val 0x%04X", addr, reg,
@@ -38,7 +51,8 @@ static esp_err_t _write_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
   esp_err_t ret = i2c_master_cmd_begin(port, cmd, pdMS_TO_TICKS(500));
   i2c_cmd_link_delete(cmd);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "I2C Write Failed: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "I2C write failed: addr=0x%02X reg=0x%02X err=%s", addr,
+             reg, esp_err_to_name(ret));
   }
   return ret;
 }
@@ -66,7 +80,8 @@ static esp_err_t _read_reg(i2c_port_t port, uint8_t addr, uint8_t reg,
   if (ret == ESP_OK) {
     *val = (int16_t)((msb << 8) | lsb);
   } else {
-    ESP_LOGE(TAG, "I2C Read Failed: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "I2C read failed: addr=0x%02X reg=0x%02X err=%s", addr, reg,
+             esp_err_to_name(ret));
   }
   return ret;
 }
@@ -80,8 +95,27 @@ esp_err_t ads1115_init(const ads1115_config_t *config,
   if (!ctx)
     return ESP_ERR_NO_MEM;
 
+  esp_err_t err = ads1115_lock_init();
+  if (err != ESP_OK) {
+    free(ctx);
+    return err;
+  }
+
   memcpy(&ctx->config, config, sizeof(ads1115_config_t));
+
+  int16_t cfg_reg = 0;
+  xSemaphoreTake(s_ads1115_lock, portMAX_DELAY);
+  err = _read_reg(config->i2c_port, config->i2c_addr, ADS_REG_CFG, &cfg_reg);
+  xSemaphoreGive(s_ads1115_lock);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "ADS1115 probe failed: addr=0x%02X err=%s",
+             config->i2c_addr, esp_err_to_name(err));
+    free(ctx);
+    return err;
+  }
+
   *ret_handle = ctx;
+  ESP_LOGI(TAG, "ADS1115 detected at addr=0x%02X", config->i2c_addr);
   return ESP_OK;
 }
 
@@ -98,16 +132,28 @@ esp_err_t ads1115_read_voltage(ads1115_handle_t handle, int channel,
                     ADS_CFG_MODE_SINGLE | ADS_CFG_DR_128SPS |
                     ADS_CFG_COMP_QUE_DISABLE;
 
-  ESP_RETURN_ON_ERROR(_write_reg(ctx->config.i2c_port, ctx->config.i2c_addr,
-                                 ADS_REG_CFG, config),
-                      TAG, "Write config failed");
+  xSemaphoreTake(s_ads1115_lock, portMAX_DELAY);
+
+  esp_err_t err = _write_reg(ctx->config.i2c_port, ctx->config.i2c_addr,
+                             ADS_REG_CFG, config);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "ADS1115 0x%02X ch%d write config failed: %s",
+             ctx->config.i2c_addr, channel, esp_err_to_name(err));
+    xSemaphoreGive(s_ads1115_lock);
+    return err;
+  }
 
   vTaskDelay(pdMS_TO_TICKS(20)); // Conversion time
 
   int16_t raw_val = 0;
-  ESP_RETURN_ON_ERROR(_read_reg(ctx->config.i2c_port, ctx->config.i2c_addr,
-                                ADS_REG_CONV, &raw_val),
-                      TAG, "Read val failed");
+  err = _read_reg(ctx->config.i2c_port, ctx->config.i2c_addr, ADS_REG_CONV,
+                  &raw_val);
+  xSemaphoreGive(s_ads1115_lock);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "ADS1115 0x%02X ch%d read conversion failed: %s",
+             ctx->config.i2c_addr, channel, esp_err_to_name(err));
+    return err;
+  }
 
   // Convert to mV (PGA=1 => 4.096V range => 0.125mV per bit)
   *out_voltage_mv = raw_val * 0.125f;
@@ -145,16 +191,30 @@ esp_err_t ads1115_read_voltage_differential(ads1115_handle_t handle,
                     ADS_CFG_MODE_SINGLE | ADS_CFG_DR_128SPS |
                     ADS_CFG_COMP_QUE_DISABLE;
 
-  ESP_RETURN_ON_ERROR(_write_reg(ctx->config.i2c_port, ctx->config.i2c_addr,
-                                 ADS_REG_CFG, config),
-                      TAG, "Write config failed");
+  xSemaphoreTake(s_ads1115_lock, portMAX_DELAY);
+
+  esp_err_t err = _write_reg(ctx->config.i2c_port, ctx->config.i2c_addr,
+                             ADS_REG_CFG, config);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "ADS1115 0x%02X diff %d-%d write config failed: %s",
+             ctx->config.i2c_addr, channel_pos, channel_neg,
+             esp_err_to_name(err));
+    xSemaphoreGive(s_ads1115_lock);
+    return err;
+  }
 
   vTaskDelay(pdMS_TO_TICKS(20)); // Conversion time
 
   int16_t raw_val = 0;
-  ESP_RETURN_ON_ERROR(_read_reg(ctx->config.i2c_port, ctx->config.i2c_addr,
-                                ADS_REG_CONV, &raw_val),
-                      TAG, "Read val failed");
+  err = _read_reg(ctx->config.i2c_port, ctx->config.i2c_addr, ADS_REG_CONV,
+                  &raw_val);
+  xSemaphoreGive(s_ads1115_lock);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "ADS1115 0x%02X diff %d-%d read conversion failed: %s",
+             ctx->config.i2c_addr, channel_pos, channel_neg,
+             esp_err_to_name(err));
+    return err;
+  }
 
   *out_voltage_mv = raw_val * 0.125f;
   return ESP_OK;

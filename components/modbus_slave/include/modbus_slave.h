@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define MODBUS_HREG_TOTAL_COUNT 243
+#define MODBUS_HREG_TOTAL_COUNT 277
 
 // Telemetry map (MUST): base + 0..8, int16 x10
 #define MODBUS_HREG_AIR_TEMP 0
@@ -180,6 +180,44 @@ extern "C" {
 #define MODBUS_HREG_HEATING_VALVE_CLOSE_MASK 241
 #define MODBUS_HREG_HEATING_SENSOR_STATUS_BITS 242
 
+// Curtain control/runtime registers
+#define MODBUS_HREG_CURTAIN_CTRL_MODE 243
+#define MODBUS_HREG_CURTAIN_MANUAL_TARGET 244
+#define MODBUS_HREG_CURTAIN_SCHEDULE_START_HHMM 245
+#define MODBUS_HREG_CURTAIN_SCHEDULE_END_HHMM 246
+#define MODBUS_HREG_CURTAIN_OUTSIDE_TARGET 247
+#define MODBUS_HREG_CURTAIN_MIN_POSITION 248
+#define MODBUS_HREG_CURTAIN_MAX_POSITION 249
+#define MODBUS_HREG_CURTAIN_POSITION_HYST 250
+#define MODBUS_HREG_CURTAIN_RADIATION_THRESHOLD 251
+#define MODBUS_HREG_CURTAIN_RADIATION_STEP_WM2 252
+#define MODBUS_HREG_CURTAIN_RADIATION_STEP_PERCENT 253
+#define MODBUS_HREG_CURTAIN_RADIATION_HYST 254
+#define MODBUS_HREG_CURTAIN_COLD_DELTA 255
+#define MODBUS_HREG_CURTAIN_COLD_HYST 256
+#define MODBUS_HREG_CURTAIN_COLD_TARGET 257
+#define MODBUS_HREG_CURTAIN_HEAT_DELTA 258
+#define MODBUS_HREG_CURTAIN_HEAT_HYST 259
+#define MODBUS_HREG_CURTAIN_HEAT_TARGET 260
+#define MODBUS_HREG_CURTAIN_HUM_LOW_THRESHOLD 261
+#define MODBUS_HREG_CURTAIN_HUM_LOW_HYST 262
+#define MODBUS_HREG_CURTAIN_HUM_LOW_TARGET 263
+#define MODBUS_HREG_CURTAIN_HUM_HIGH_THRESHOLD 264
+#define MODBUS_HREG_CURTAIN_HUM_HIGH_HYST 265
+#define MODBUS_HREG_CURTAIN_HUM_HIGH_TARGET 266
+#define MODBUS_HREG_CURTAIN_TARGET 267
+#define MODBUS_HREG_CURTAIN_BASE_TARGET 268
+#define MODBUS_HREG_CURTAIN_CURRENT_MA 269
+#define MODBUS_HREG_CURTAIN_STATUS_BITS 270
+#define MODBUS_HREG_CURTAIN_REASON_BITS 271
+#define MODBUS_HREG_CURTAIN_POSITION_STATUS_BITS 272
+#define MODBUS_HREG_CURTAIN_FAULT_CODE 273
+#define MODBUS_HREG_CURTAIN_FAULT_RESET_TOKEN 274
+
+// Global greenhouse targets
+#define MODBUS_HREG_AIR_TEMP_TARGET 275
+#define MODBUS_HREG_AIR_HUM_TARGET 276
+
 typedef enum {
   MODBUS_MODE_REMOTE = 0,
   MODBUS_MODE_AUTONOMOUS = 1,
@@ -230,6 +268,12 @@ typedef enum {
 } modbus_heating_ctrl_mode_t;
 
 typedef enum {
+  MODBUS_CURTAIN_CTRL_MODE_AUTO = 0,
+  MODBUS_CURTAIN_CTRL_MODE_MANUAL = 1,
+  MODBUS_CURTAIN_CTRL_MODE_OFF = 2,
+} modbus_curtain_ctrl_mode_t;
+
+typedef enum {
   MODBUS_WINDOWS_CTRL_MODE_AUTO = 0,
   MODBUS_WINDOWS_CTRL_MODE_MANUAL = 1,
 } modbus_windows_ctrl_mode_t;
@@ -266,6 +310,7 @@ typedef struct {
   uint16_t wind_dir_deg;
   uint16_t source_age_s;
   uint16_t status_bits;
+  float solar_radiation_wm2;
   uint32_t rx_age_ms;
   bool valid;
   bool stale;
@@ -304,8 +349,10 @@ void modbus_get_sensor_test_override(
 
 float modbus_get_window_a_target_percent(void);
 float modbus_get_window_b_target_percent(void);
+float modbus_get_curtain_target_percent(void);
 modbus_windows_ctrl_mode_t modbus_get_windows_ctrl_mode(void);
 bool modbus_get_windows_force_safe_cmd(void);
+float modbus_get_air_temp_target_c(void);
 float modbus_get_windows_temp_setpoint_c(void);
 float modbus_get_windows_safe_min_percent(void);
 float modbus_get_windows_wind_limit_ms(void);
@@ -318,6 +365,7 @@ float modbus_get_windows_temp_step_hysteresis_c(void);
 float modbus_get_windows_temp_step_target_increment_percent(void);
 uint16_t modbus_get_windows_temp_step_max_index(void);
 modbus_windows_auto_algo_mode_t modbus_get_windows_auto_algo_mode(void);
+float modbus_get_air_hum_target_percent(void);
 float modbus_get_windows_humidity_setpoint_percent(void);
 float modbus_get_windows_humidity_step_percent(void);
 float modbus_get_windows_humidity_step_hysteresis_percent(void);
@@ -358,6 +406,36 @@ void modbus_set_windows_target_diagnostics(
     float effective_target_a_percent, float effective_target_b_percent,
     uint16_t active_protection_bits,
     modbus_windows_windward_side_t windward_side);
+modbus_curtain_ctrl_mode_t modbus_get_curtain_ctrl_mode(void);
+float modbus_get_curtain_manual_target_percent(void);
+uint16_t modbus_get_curtain_schedule_start_hhmm(void);
+uint16_t modbus_get_curtain_schedule_end_hhmm(void);
+float modbus_get_curtain_outside_target_percent(void);
+float modbus_get_curtain_min_position_percent(void);
+float modbus_get_curtain_max_position_percent(void);
+float modbus_get_curtain_position_hysteresis_percent(void);
+uint16_t modbus_get_curtain_radiation_threshold_wm2(void);
+uint16_t modbus_get_curtain_radiation_step_wm2(void);
+float modbus_get_curtain_radiation_step_percent(void);
+uint16_t modbus_get_curtain_radiation_hysteresis_wm2(void);
+float modbus_get_curtain_cold_delta_c(void);
+float modbus_get_curtain_cold_hysteresis_c(void);
+float modbus_get_curtain_cold_target_percent(void);
+float modbus_get_curtain_heat_delta_c(void);
+float modbus_get_curtain_heat_hysteresis_c(void);
+float modbus_get_curtain_heat_target_percent(void);
+float modbus_get_curtain_humidity_low_threshold_percent(void);
+float modbus_get_curtain_humidity_low_hysteresis_percent(void);
+float modbus_get_curtain_humidity_low_target_percent(void);
+float modbus_get_curtain_humidity_high_threshold_percent(void);
+float modbus_get_curtain_humidity_high_hysteresis_percent(void);
+float modbus_get_curtain_humidity_high_target_percent(void);
+uint16_t modbus_get_curtain_fault_reset_token(void);
+void modbus_set_curtain_runtime(float target_percent, float base_target_percent,
+                                float current_ma, uint16_t status_bits,
+                                uint16_t reason_bits,
+                                uint16_t position_status_bits,
+                                uint16_t fault_code);
 float modbus_get_water_setpoint_c(modbus_water_channel_t channel);
 modbus_heating_ctrl_mode_t modbus_get_heating_ctrl_mode(void);
 float modbus_get_heating_air_setpoint_c(void);

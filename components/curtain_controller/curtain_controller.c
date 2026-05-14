@@ -8,6 +8,7 @@
 #include <string.h>
 
 static const char *TAG = "curtain_controller";
+#define CURTAIN_CONTROLLER_LOG_PERIOD_US (5000000LL)
 
 typedef enum {
   CURTAIN_OUTPUT_STOP = 0,
@@ -29,6 +30,7 @@ struct curtain_controller_ctx_t {
   float motion_ref_position_percent;
   int64_t motion_ref_time_us;
   int64_t boot_time_us;
+  int64_t last_status_log_us;
 };
 
 static float clampf_local(float value, float min_value, float max_value) {
@@ -39,6 +41,15 @@ static float clampf_local(float value, float min_value, float max_value) {
     return max_value;
   }
   return value;
+}
+
+static float clamp_target_percent(const curtain_controller_settings_t *settings,
+                                  float target_percent) {
+  if (target_percent <= 0.0f) {
+    return 0.0f;
+  }
+  return clampf_local(target_percent, settings->min_position_percent,
+                      settings->max_position_percent);
 }
 
 static bool value_is_valid(float value) {
@@ -172,8 +183,7 @@ static float calculate_auto_target(curtain_controller_handle_t handle,
                                    uint16_t *reason_bits,
                                    float *base_target_percent) {
   const bool in_schedule = schedule_active(settings, inputs);
-  float target = in_schedule ? settings->min_position_percent
-                             : settings->outside_target_percent;
+  float target = settings->min_position_percent;
 
   if (reason_bits != NULL) {
     if (in_schedule) {
@@ -221,8 +231,7 @@ static float calculate_auto_target(curtain_controller_handle_t handle,
     handle->radiation_active = false;
   }
 
-  target = clampf_local(target, settings->min_position_percent,
-                        settings->max_position_percent);
+  target = clamp_target_percent(settings, target);
   if (base_target_percent != NULL) {
     *base_target_percent = target;
   }
@@ -233,37 +242,58 @@ static float calculate_auto_target(curtain_controller_handle_t handle,
                              value_is_valid(inputs->temp_setpoint_c);
   update_latched_rule(
       &handle->cold_active, can_eval_temp,
-      inputs->air_temp_c <= inputs->temp_setpoint_c - settings->cold_delta_c,
-      inputs->air_temp_c >= inputs->temp_setpoint_c - settings->cold_delta_c +
-                                settings->cold_hysteresis_c);
+      inputs->air_temp_c <= inputs->temp_setpoint_c - settings->cold_delta_c -
+                                settings->cold_hysteresis_c,
+      inputs->air_temp_c >= inputs->temp_setpoint_c - settings->cold_delta_c);
   update_latched_rule(
       &handle->heat_active, can_eval_temp,
-      inputs->air_temp_c >= inputs->temp_setpoint_c + settings->heat_delta_c,
-      inputs->air_temp_c <= inputs->temp_setpoint_c + settings->heat_delta_c -
-                                settings->heat_hysteresis_c);
+      inputs->air_temp_c >= inputs->temp_setpoint_c + settings->heat_delta_c +
+                                settings->heat_hysteresis_c,
+      inputs->air_temp_c <= inputs->temp_setpoint_c + settings->heat_delta_c);
 
   const bool can_eval_humidity = inputs->humidity_valid &&
                                  value_is_valid(inputs->humidity_percent);
+  float humidity_low_threshold = settings->humidity_low_threshold_percent;
+  float humidity_low_release = settings->humidity_low_threshold_percent +
+                               settings->humidity_low_hysteresis_percent;
+  float humidity_high_threshold = settings->humidity_high_threshold_percent;
+  float humidity_high_release = settings->humidity_high_threshold_percent -
+                                settings->humidity_high_hysteresis_percent;
+  if (settings->humidity_setpoint_valid &&
+      value_is_valid(settings->humidity_setpoint_percent)) {
+    const float target =
+        clampf_local(settings->humidity_setpoint_percent, 0.0f, 100.0f);
+    humidity_low_threshold =
+        clampf_local(target - settings->humidity_low_threshold_percent -
+                         settings->humidity_low_hysteresis_percent,
+                     0.0f, 100.0f);
+    humidity_low_release =
+        clampf_local(target - settings->humidity_low_threshold_percent, 0.0f,
+                     100.0f);
+    humidity_high_threshold =
+        clampf_local(target + settings->humidity_high_threshold_percent +
+                         settings->humidity_high_hysteresis_percent,
+                     0.0f, 100.0f);
+    humidity_high_release =
+        clampf_local(target + settings->humidity_high_threshold_percent, 0.0f,
+                     100.0f);
+  }
   update_latched_rule(
       &handle->humidity_low_active, can_eval_humidity,
-      inputs->humidity_percent <= settings->humidity_low_threshold_percent,
-      inputs->humidity_percent >= settings->humidity_low_threshold_percent +
-                                      settings->humidity_low_hysteresis_percent);
+      inputs->humidity_percent <= humidity_low_threshold,
+      inputs->humidity_percent >= humidity_low_release);
   update_latched_rule(
       &handle->humidity_high_active, can_eval_humidity,
-      inputs->humidity_percent >= settings->humidity_high_threshold_percent,
-      inputs->humidity_percent <= settings->humidity_high_threshold_percent -
-                                      settings->humidity_high_hysteresis_percent);
+      inputs->humidity_percent >= humidity_high_threshold,
+      inputs->humidity_percent <= humidity_high_release);
 
   if (can_eval_temp) {
     if (handle->heat_active) {
-      target = fmaxf(target, settings->heat_target_percent);
       if (reason_bits != NULL) {
         *reason_bits |= CURTAIN_CONTROLLER_REASON_HEAT_OPEN;
       }
     }
     if (handle->cold_active) {
-      target = fminf(target, settings->cold_target_percent);
       if (reason_bits != NULL) {
         *reason_bits |= CURTAIN_CONTROLLER_REASON_COLD_CLOSE;
       }
@@ -274,13 +304,11 @@ static float calculate_auto_target(curtain_controller_handle_t handle,
 
   if (can_eval_humidity) {
     if (handle->humidity_low_active) {
-      target = fmaxf(target, settings->humidity_low_target_percent);
       if (reason_bits != NULL) {
         *reason_bits |= CURTAIN_CONTROLLER_REASON_HUMIDITY_LOW_OPEN;
       }
     }
     if (handle->humidity_high_active) {
-      target = fminf(target, settings->humidity_high_target_percent);
       if (reason_bits != NULL) {
         *reason_bits |= CURTAIN_CONTROLLER_REASON_HUMIDITY_HIGH_CLOSE;
       }
@@ -289,8 +317,20 @@ static float calculate_auto_target(curtain_controller_handle_t handle,
     *reason_bits |= CURTAIN_CONTROLLER_REASON_HUM_SENSOR_FAULT;
   }
 
-  return clampf_local(target, settings->min_position_percent,
-                      settings->max_position_percent);
+  if (handle->humidity_low_active) {
+    target = settings->humidity_low_target_percent;
+  }
+  if (handle->humidity_high_active) {
+    target = settings->humidity_high_target_percent;
+  }
+  if (handle->cold_active) {
+    target = settings->cold_target_percent;
+  }
+  if (handle->heat_active) {
+    target = settings->heat_target_percent;
+  }
+
+  return clamp_target_percent(settings, target);
 }
 
 static void update_motion_fault(curtain_controller_handle_t handle,
@@ -495,12 +535,19 @@ esp_err_t curtain_controller_process(
   esp_err_t err = apply_output(handle, requested_cmd);
   rebuild_status_bits(handle, cfg.mode);
 
-  ESP_LOGI(TAG,
-           "Curtain mode=%u pos=%.1f%% target=%.1f%% out=%u fault=%u reason=0x%X",
-           (unsigned)cfg.mode, handle->status.position_percent,
-           handle->status.target_percent, (unsigned)requested_cmd,
-           (unsigned)handle->status.fault_code,
-           (unsigned)handle->status.reason_bits);
+  const int64_t now_us = esp_timer_get_time();
+  if (handle->last_status_log_us == 0 ||
+      now_us - handle->last_status_log_us >= CURTAIN_CONTROLLER_LOG_PERIOD_US) {
+    ESP_LOGI(TAG,
+             "Curtain mode=%u pos=%.1f%% target=%.1f%% current=%.1fmA out=%u fault=%u reason=0x%X motion=%.1f%% nomotion_ms=%lu",
+             (unsigned)cfg.mode, handle->status.position_percent,
+             handle->status.target_percent, handle->status.current_ma,
+             (unsigned)requested_cmd, (unsigned)handle->status.fault_code,
+             (unsigned)handle->status.reason_bits,
+             handle->config.motion_delta_percent,
+             (unsigned long)handle->config.no_motion_timeout_ms);
+    handle->last_status_log_us = now_us;
+  }
   return err;
 }
 
@@ -509,6 +556,25 @@ esp_err_t curtain_controller_get_status(
   ESP_RETURN_ON_FALSE(handle != NULL && out_status != NULL, ESP_ERR_INVALID_ARG,
                       TAG, "invalid args");
   *out_status = handle->status;
+  return ESP_OK;
+}
+
+esp_err_t curtain_controller_set_motion_fault_config(
+    curtain_controller_handle_t handle, float motion_delta_percent,
+    uint32_t no_motion_timeout_ms) {
+  ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG,
+                      "invalid handle");
+  if (!isfinite(motion_delta_percent) || motion_delta_percent < 0.0f) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  handle->config.motion_delta_percent = motion_delta_percent;
+  handle->config.no_motion_timeout_ms = no_motion_timeout_ms;
+  if (no_motion_timeout_ms == 0U &&
+      handle->status.fault_code == CURTAIN_CONTROLLER_FAULT_NO_MOTION) {
+    handle->status.fault_code = CURTAIN_CONTROLLER_FAULT_NONE;
+    handle->motion_ref_valid = false;
+  }
   return ESP_OK;
 }
 

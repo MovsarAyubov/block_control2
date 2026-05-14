@@ -1,4 +1,6 @@
 #include "bt_ascii_control.h"
+#include "ads1115.h"
+#include "curtain_controller.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "ds3231.h"
@@ -75,6 +77,8 @@ static const char *TAG = "APP";
 #define HC595_BIT_HEATING_UPPER_PUMP 11U
 #define HC595_BIT_HEATING_UNDERTRAY_PUMP 12U
 #define HC595_BIT_HEATING_GROW_PUMP 13U
+#define HC595_BIT_CURTAIN_OPEN 14U
+#define HC595_BIT_CURTAIN_CLOSE 15U
 
 // Window motor config
 #define WINDOW_A_NAME "window_a"
@@ -94,13 +98,26 @@ static const char *TAG = "APP";
 #define WINDOW_B_PIN_LOCAL_MANUAL GPIO_NUM_NC
 #define WINDOW_LOCAL_MANUAL_ACTIVE_HIGH true
 
-// RH sensor uses ADS1115 at 0x48. Window positioners share ADS1115 at 0x49.
+// RH sensor and curtain positioner share ADS1115 at 0x48.
+// Window positioners share ADS1115 at 0x49.
 #define WINDOW_A_ADS_ADDR ADS1115_ADDR_VDD
 #define WINDOW_A_ADS_CH_POS 0U
 #define WINDOW_A_ADS_CH_NEG 1U
 #define WINDOW_B_ADS_ADDR ADS1115_ADDR_VDD
 #define WINDOW_B_ADS_CH_POS 2U
 #define WINDOW_B_ADS_CH_NEG 3U
+
+// Curtain positioner uses ADS1115 0x48 differential input AIN2-AIN3.
+#define CURTAIN_NAME "curtain"
+#define CURTAIN_ADS_ADDR ADS1115_ADDR_GND
+#define CURTAIN_ADS_CH_POS 2U
+#define CURTAIN_ADS_CH_NEG 3U
+#define CURTAIN_SENSOR_SHUNT_OHM 109.3f
+#define CURTAIN_ENCODER_MIN_MA 3.6f
+#define CURTAIN_ENCODER_MAX_MA 20.5f
+#define CURTAIN_BOOT_WAIT_POSITION_TIMEOUT_MS 1000U
+#define CURTAIN_MOTION_DELTA_DEFAULT_PERCENT 0.5f
+#define CURTAIN_NO_MOTION_DEFAULT_MS 3000U
 
 // Window logic defaults
 #define WINDOWS_WEATHER_STALE_TIMEOUT_DEFAULT_MS 20000U
@@ -125,7 +142,7 @@ static const char *TAG = "APP";
 #define WINDOWS_HUM_STEP_MAX_INDEX_DEFAULT 5U
 #define WINDOWS_COLD_CLOSE_DELTA_DEFAULT_C 2.0f
 #define WINDOWS_COLD_CLOSE_HYST_DEFAULT_C 0.5f
-#define WINDOWS_WIND_SPEED_TARGET_STEP_MS 0.5f
+#define WINDOWS_WIND_SPEED_TARGET_STEP_MS 1.0f
 #define WINDOWS_WINDWARD_MIN_DEFAULT_PERCENT 0.0f
 #define WINDOWS_WINDWARD_MAX_DEFAULT_PERCENT 0.0f
 #define WINDOWS_WINDWARD_REDUCTION_DEFAULT_PERCENT_PER_MS 0.0f
@@ -239,7 +256,7 @@ typedef struct {
 
 typedef struct {
   bool active;
-  float dynamic_max_percent;
+  float reduction_percent;
 } window_wind_cap_t;
 
 typedef struct {
@@ -338,6 +355,7 @@ static ds3231_handle_t rtc_handle = NULL;
 static bool s_rtc_available = false;
 static rll400_handle_t s_window_a_handle = NULL;
 static rll400_handle_t s_window_b_handle = NULL;
+static curtain_controller_handle_t s_curtain_handle = NULL;
 static portMUX_TYPE s_sensor_lock = portMUX_INITIALIZER_UNLOCKED;
 static app_sensor_snapshot_t s_sensor_snapshot = {0};
 static window_pair_runtime_t s_window_runtime = {0};
@@ -605,8 +623,7 @@ static void read_window_settings(window_settings_t *settings) {
   settings->motion_delta_percent = sanitize_positive_or_default(
       modbus_get_rll400_motion_delta_percent(),
       WINDOWS_MOTION_DELTA_DEFAULT_PERCENT);
-  settings->no_motion_timeout_ms = sanitize_timeout_or_default(
-      modbus_get_rll400_no_motion_timeout_ms(), WINDOWS_NO_MOTION_DEFAULT_MS);
+  settings->no_motion_timeout_ms = modbus_get_rll400_no_motion_timeout_ms();
 
   settings->wind_limit_ms = clampf_local(settings->wind_limit_ms, 0.1f, 100.0f);
   settings->wind_storm_ms = clampf_local(settings->wind_storm_ms, 0.1f, 100.0f);
@@ -708,13 +725,12 @@ calculate_wind_cap(float wind_speed_ms,
                    window_wind_speed_hold_t *speed_hold) {
   window_wind_cap_t cap = {
       .active = false,
-      .dynamic_max_percent = 100.0f,
+      .reduction_percent = 0.0f,
   };
   if (role_settings == NULL || !isfinite(wind_speed_ms)) {
     return cap;
   }
 
-  cap.dynamic_max_percent = role_settings->max_percent;
   const float calculation_wind_speed_ms = stabilize_wind_speed_for_target(
       wind_speed_ms, role_settings->speed_threshold_ms, speed_hold);
   if (calculation_wind_speed_ms < role_settings->speed_threshold_ms) {
@@ -728,12 +744,8 @@ calculate_wind_cap(float wind_speed_ms,
   }
 
   cap.active = true;
-  cap.dynamic_max_percent =
-      role_settings->max_percent -
-      (excess_ms * role_settings->reduction_percent_per_ms);
-  cap.dynamic_max_percent =
-      clampf_local(cap.dynamic_max_percent, role_settings->min_percent,
-                   role_settings->max_percent);
+  cap.reduction_percent =
+      excess_ms * role_settings->reduction_percent_per_ms;
   return cap;
 }
 
@@ -744,10 +756,8 @@ static float apply_leeward_wind_cap(
     return target_percent;
   }
 
-  const float max_percent = fmaxf(cap->dynamic_max_percent,
-                                  role_settings->min_percent);
-  return clampf_local(fminf(target_percent, max_percent),
-                      role_settings->min_percent, max_percent);
+  return clampf_local(target_percent - cap->reduction_percent,
+                      role_settings->min_percent, role_settings->max_percent);
 }
 
 static float apply_windward_wind_cap(
@@ -758,19 +768,16 @@ static float apply_windward_wind_cap(
     return target_percent;
   }
 
-  float max_percent = fminf(cap->dynamic_max_percent,
+  float max_percent = fminf(role_settings->max_percent,
                             leeward_target_percent - lag_percent);
   max_percent = fmaxf(max_percent, role_settings->min_percent);
-  max_percent = fminf(max_percent, role_settings->max_percent);
-  return clampf_local(fminf(target_percent, max_percent),
+  return clampf_local(target_percent - cap->reduction_percent,
                       role_settings->min_percent, max_percent);
 }
 
-static float apply_rain_cap(float target_percent, float rain_cap_percent,
-                            float min_percent) {
-  const float max_percent = fmaxf(rain_cap_percent, min_percent);
-  return clampf_local(fminf(target_percent, max_percent), min_percent,
-                      max_percent);
+static float apply_rain_cap(float target_percent, float rain_cap_percent) {
+  const float max_percent = clampf_local(rain_cap_percent, 0.0f, 100.0f);
+  return clampf_local(fminf(target_percent, max_percent), 0.0f, max_percent);
 }
 
 static modbus_windows_windward_side_t
@@ -1142,6 +1149,26 @@ static esp_err_t init_window_controllers(void) {
   return ESP_OK;
 }
 
+static esp_err_t init_curtain_controller(void) {
+  curtain_controller_config_t cfg = {
+      .name = CURTAIN_NAME,
+      .i2c_port = I2C_MASTER_NUM,
+      .ads_addr = CURTAIN_ADS_ADDR,
+      .ads_channel_pos = CURTAIN_ADS_CH_POS,
+      .ads_channel_neg = CURTAIN_ADS_CH_NEG,
+      .shunt_resistor_ohm = CURTAIN_SENSOR_SHUNT_OHM,
+      .encoder_min_ma = CURTAIN_ENCODER_MIN_MA,
+      .encoder_max_ma = CURTAIN_ENCODER_MAX_MA,
+      .boot_wait_position_timeout_ms = CURTAIN_BOOT_WAIT_POSITION_TIMEOUT_MS,
+      .motion_delta_percent = CURTAIN_MOTION_DELTA_DEFAULT_PERCENT,
+      .no_motion_timeout_ms = CURTAIN_NO_MOTION_DEFAULT_MS,
+      .outputs = s_hc595_outputs,
+      .open_bit_index = HC595_BIT_CURTAIN_OPEN,
+      .close_bit_index = HC595_BIT_CURTAIN_CLOSE,
+  };
+  return curtain_controller_init(&cfg, &s_curtain_handle);
+}
+
 static bool modbus_rtc_get_time_cb(uint8_t *hour, uint8_t *minute,
                                    uint8_t *second, void *ctx) {
   (void)ctx;
@@ -1356,23 +1383,19 @@ static void process_windows(const app_sensor_snapshot_t *sensor_snapshot,
     if (!weather_stale && weather.rain_active &&
         settings.rain_mode == MODBUS_WINDOWS_RAIN_MODE_WINDWARD) {
       if (windward_side == MODBUS_WINDOWS_WINDWARD_SIDE_A) {
-        final_target_a = apply_rain_cap(final_target_a,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
+        final_target_a =
+            apply_rain_cap(final_target_a, settings.rain_windward_percent);
         rain_limit_a_active = true;
       } else if (windward_side == MODBUS_WINDOWS_WINDWARD_SIDE_B) {
-        final_target_b = apply_rain_cap(final_target_b,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
+        final_target_b =
+            apply_rain_cap(final_target_b, settings.rain_windward_percent);
         rain_limit_b_active = true;
       } else {
         windward_side = MODBUS_WINDOWS_WINDWARD_SIDE_BOTH_UNKNOWN;
-        final_target_a = apply_rain_cap(final_target_a,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
-        final_target_b = apply_rain_cap(final_target_b,
-                                        settings.rain_windward_percent,
-                                        settings.windward.min_percent);
+        final_target_a =
+            apply_rain_cap(final_target_a, settings.rain_windward_percent);
+        final_target_b =
+            apply_rain_cap(final_target_b, settings.rain_windward_percent);
         rain_limit_a_active = true;
         rain_limit_b_active = true;
       }
@@ -1496,6 +1519,129 @@ static void process_windows(const app_sensor_snapshot_t *sensor_snapshot,
   }
 }
 
+static void process_curtain(const app_sensor_snapshot_t *sensor_snapshot,
+                            float *out_pos_percent) {
+  if (s_curtain_handle == NULL) {
+    return;
+  }
+
+  modbus_weather_runtime_t weather = {0};
+  modbus_get_weather_runtime(&weather);
+
+  ds3231_time_t now = {0};
+  bool time_valid = false;
+  if (s_rtc_available && rtc_handle != NULL &&
+      ds3231_get_time(rtc_handle, &now) == ESP_OK) {
+    time_valid = true;
+  } else {
+    const uint32_t sec_of_day =
+        (uint32_t)((esp_timer_get_time() / 1000000ULL) % 86400ULL);
+    now.hour = (uint8_t)((sec_of_day / 3600U) % 24U);
+    now.minute = (uint8_t)((sec_of_day % 3600U) / 60U);
+    now.second = (uint8_t)(sec_of_day % 60U);
+    time_valid = true;
+  }
+
+  const modbus_curtain_ctrl_mode_t raw_mode = modbus_get_curtain_ctrl_mode();
+  curtain_controller_mode_t mode = CURTAIN_CONTROLLER_MODE_MANUAL;
+  if (raw_mode == MODBUS_CURTAIN_CTRL_MODE_AUTO) {
+    mode = CURTAIN_CONTROLLER_MODE_AUTO;
+  } else if (raw_mode == MODBUS_CURTAIN_CTRL_MODE_OFF) {
+    mode = CURTAIN_CONTROLLER_MODE_OFF;
+  }
+
+  curtain_controller_settings_t settings = {
+      .mode = mode,
+      .schedule_start_hhmm = modbus_get_curtain_schedule_start_hhmm(),
+      .schedule_end_hhmm = modbus_get_curtain_schedule_end_hhmm(),
+      .manual_target_percent = modbus_get_curtain_manual_target_percent(),
+      .outside_target_percent = modbus_get_curtain_outside_target_percent(),
+      .position_hysteresis_percent =
+          modbus_get_curtain_position_hysteresis_percent(),
+      .min_position_percent = modbus_get_curtain_min_position_percent(),
+      .max_position_percent = modbus_get_curtain_max_position_percent(),
+      .radiation_threshold_wm2 =
+          modbus_get_curtain_radiation_threshold_wm2(),
+      .radiation_step_wm2 = modbus_get_curtain_radiation_step_wm2(),
+      .radiation_step_percent =
+          modbus_get_curtain_radiation_step_percent(),
+      .radiation_hysteresis_wm2 =
+          modbus_get_curtain_radiation_hysteresis_wm2(),
+      .cold_delta_c = modbus_get_curtain_cold_delta_c(),
+      .cold_hysteresis_c = modbus_get_curtain_cold_hysteresis_c(),
+      .cold_target_percent = modbus_get_curtain_cold_target_percent(),
+      .heat_delta_c = modbus_get_curtain_heat_delta_c(),
+      .heat_hysteresis_c = modbus_get_curtain_heat_hysteresis_c(),
+      .heat_target_percent = modbus_get_curtain_heat_target_percent(),
+      .humidity_low_threshold_percent =
+          modbus_get_curtain_humidity_low_threshold_percent(),
+      .humidity_low_hysteresis_percent =
+          modbus_get_curtain_humidity_low_hysteresis_percent(),
+      .humidity_low_target_percent =
+          modbus_get_curtain_humidity_low_target_percent(),
+      .humidity_high_threshold_percent =
+          modbus_get_curtain_humidity_high_threshold_percent(),
+      .humidity_high_hysteresis_percent =
+          modbus_get_curtain_humidity_high_hysteresis_percent(),
+      .humidity_high_target_percent =
+          modbus_get_curtain_humidity_high_target_percent(),
+      .humidity_setpoint_percent = modbus_get_air_hum_target_percent(),
+      .humidity_setpoint_valid = true,
+  };
+
+  const float motion_delta_percent = clampf_local(
+      sanitize_positive_or_default(modbus_get_rll400_motion_delta_percent(),
+                                   WINDOWS_MOTION_DELTA_DEFAULT_PERCENT),
+      0.1f, 20.0f);
+  const uint32_t no_motion_timeout_ms = modbus_get_rll400_no_motion_timeout_ms();
+  (void)curtain_controller_set_motion_fault_config(
+      s_curtain_handle, motion_delta_percent, no_motion_timeout_ms);
+
+  curtain_controller_inputs_t inputs = {
+      .hour = now.hour,
+      .minute = now.minute,
+      .second = now.second,
+      .time_valid = time_valid,
+      .air_temp_c = sensor_snapshot != NULL ? sensor_snapshot->temp_air : 0.0f,
+      .air_temp_valid =
+          sensor_snapshot != NULL && sensor_snapshot->temp_air_valid,
+      .humidity_percent = sensor_snapshot != NULL ? sensor_snapshot->rh : 0.0f,
+      .humidity_valid = sensor_snapshot != NULL && sensor_snapshot->rh_valid,
+      .radiation_wm2 = weather.solar_radiation_wm2,
+      .radiation_valid = weather.valid && !weather.stale,
+      .temp_setpoint_c = modbus_get_air_temp_target_c(),
+      .temp_setpoint_valid = true,
+  };
+
+  static uint16_t last_fault_reset_token = 0U;
+  const uint16_t reset_token = modbus_get_curtain_fault_reset_token();
+  if (reset_token != 0U && reset_token != last_fault_reset_token) {
+    if (curtain_controller_reset_fault(s_curtain_handle) == ESP_OK) {
+      ESP_LOGI(TAG, "Curtain fault reset token accepted: %u",
+               (unsigned)reset_token);
+    }
+    last_fault_reset_token = reset_token;
+  }
+
+  const esp_err_t err =
+      curtain_controller_process(s_curtain_handle, &settings, &inputs);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Curtain processing failed: %s", esp_err_to_name(err));
+  }
+
+  curtain_controller_status_t status = {0};
+  if (curtain_controller_get_status(s_curtain_handle, &status) == ESP_OK) {
+    modbus_set_curtain_runtime(status.target_percent,
+                               status.base_target_percent, status.current_ma,
+                               status.status_bits, status.reason_bits,
+                               status.position_status_bits,
+                               (uint16_t)status.fault_code);
+    if (out_pos_percent != NULL) {
+      *out_pos_percent = status.position_percent;
+    }
+  }
+}
+
 static void control_task(void *arg) {
   (void)arg;
   ESP_LOGI(TAG, "Control task started (%ums)", (unsigned)CONTROL_LOOP_MS);
@@ -1509,14 +1655,17 @@ static void control_task(void *arg) {
     const app_sensor_snapshot_t sensors = get_sensor_snapshot();
     float window_a_pos_percent = 0.0f;
     float window_b_pos_percent = 0.0f;
+    float curtain_pos_percent = 0.0f;
     process_windows(&sensors, &window_a_pos_percent, &window_b_pos_percent);
+    process_curtain(&sensors, &curtain_pos_percent);
 
     modbus_set_telemetry(sensors.temp_air, sensors.rh,
                          sensors.water_temp[HEATING_CONTOUR_RAIL],
                          sensors.water_temp[HEATING_CONTOUR_GROW],
                          sensors.water_temp[HEATING_CONTOUR_UNDERTRAY],
                          sensors.water_temp[HEATING_CONTOUR_UPPER],
-                         window_a_pos_percent, window_b_pos_percent, 0.0f);
+                         window_a_pos_percent, window_b_pos_percent,
+                         curtain_pos_percent);
 
     vTaskDelay(pdMS_TO_TICKS(CONTROL_LOOP_MS));
   }
@@ -1527,6 +1676,7 @@ static void configure_runtime_log_levels(void) {
     esp_log_level_set("*", ESP_LOG_NONE);
   }
   esp_log_level_set("rll400", ESP_LOG_INFO);
+  esp_log_level_set("curtain_controller", ESP_LOG_INFO);
 }
 
 static void worker_task(void *arg) {
@@ -1553,6 +1703,11 @@ static void worker_task(void *arg) {
       rtc_time.minute = (uint8_t)((sec_of_day % 3600U) / 60U);
       rtc_time.second = (uint8_t)(sec_of_day % 60U);
     }
+    ESP_LOGI(TAG,
+             "Time: %02u:%02u:%02u source=%s greenhouse_targets[temp=%.1fC hum=%.1f%%]",
+             rtc_time.hour, rtc_time.minute, rtc_time.second,
+             time_ok ? "rtc" : "uptime", modbus_get_air_temp_target_c(),
+             modbus_get_air_hum_target_percent());
     modbus_set_light_current_time(rtc_time.hour, rtc_time.minute, rtc_time.second);
 
     float pin_mv = 0.0f;
@@ -1709,6 +1864,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(init_heating_controllers());
   ESP_ERROR_CHECK(apply_light_outputs(false, false));
   ESP_ERROR_CHECK(init_window_controllers());
+  ESP_ERROR_CHECK(init_curtain_controller());
 
   xTaskCreate(control_task, "ctrl", 6144, NULL, 6, NULL);
   xTaskCreate(worker_task, "worker", 8192, NULL, 5, NULL);

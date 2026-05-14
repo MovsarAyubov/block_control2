@@ -20,13 +20,15 @@
 ### 2.2.1 ADS1115
 | ADDR pin | I2C address | Назначение |
 | --- | --- | --- |
-| GND | `0x48` | RH sensor |
+| GND | `0x48` | RH sensor, curtain positioner |
 | VDD | `0x49` | Позиционеры форточек A и B |
 | SDA | `0x4A` | Резерв |
 | SCL | `0x4B` | Резерв |
 
 - ADS1115 `0x49`, `AIN0-AIN1`: позиционер форточки A
 - ADS1115 `0x49`, `AIN2-AIN3`: позиционер форточки B
+
+- ADS1115 `0x48`, `AIN2-AIN3`: curtain positioner
 
 ### 2.2.2 SPI / MAX31865
 - SPI host: `SPI2_HOST`

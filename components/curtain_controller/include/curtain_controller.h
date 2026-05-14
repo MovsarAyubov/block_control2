@@ -67,6 +67,8 @@ typedef struct {
   float humidity_high_threshold_percent;
   float humidity_high_hysteresis_percent;
   float humidity_high_target_percent;
+  float humidity_setpoint_percent;
+  bool humidity_setpoint_valid;
 } curtain_controller_settings_t;
 
 typedef struct {
@@ -141,6 +143,9 @@ esp_err_t curtain_controller_process(
     const curtain_controller_inputs_t *inputs);
 esp_err_t curtain_controller_get_status(
     curtain_controller_handle_t handle, curtain_controller_status_t *out_status);
+esp_err_t curtain_controller_set_motion_fault_config(
+    curtain_controller_handle_t handle, float motion_delta_percent,
+    uint32_t no_motion_timeout_ms);
 esp_err_t curtain_controller_stop(curtain_controller_handle_t handle);
 esp_err_t curtain_controller_reset_fault(curtain_controller_handle_t handle);
 esp_err_t curtain_controller_del(curtain_controller_handle_t handle);

@@ -84,7 +84,9 @@
 - `bit11` -> Upper pump contactor
 - `bit12` -> Undertray pump contactor
 - `bit13` -> Grow pipe pump contactor
-- `bit14..23` -> reserved
+- `bit14` -> Curtain `OPEN`
+- `bit15` -> Curtain `CLOSE`
+- `bit16..23` -> reserved
 - Valve outputs have an interlock: `OPEN` and `CLOSE` for the same valve are never driven together.
 
 ### Bluetooth ASCII aliases for autonomous setpoints
@@ -209,8 +211,8 @@
 - `181` WINDOWS_TEMP_STEP_HYST_C, `x10 C`
 - `182` RLL400_TARGET_HYST_PERCENT, `x10 %`; also stabilizes small
   effective-target changes before they are sent to RLL400
-- `183` RLL400_MOTION_DELTA_PERCENT, `x10 %`
-- `184` RLL400_NO_MOTION_TIMEOUT_MS
+- `183` ACTUATOR_MOTION_DELTA_PERCENT, `x10 %`; shared by windows and curtain
+- `184` ACTUATOR_NO_MOTION_TIMEOUT_MS; shared by windows and curtain, `0` disables no-motion fault
 - `185` WINDOW_A_FAULT_RESET_TOKEN
 - `186` WINDOW_B_FAULT_RESET_TOKEN
 - `187` WINDOWS_STATUS_BITS
@@ -250,11 +252,17 @@
 - `221` WINDOWS_HUM_STEP_TARGET_PERCENT, `x10 %`
 - `222` WINDOWS_HUM_STEP_MAX_INDEX, legacy/reserved
 
-Wind reduction uses the normal formula
-`dynamic_max = max_percent - (wind_speed - threshold) * reduction`, but the wind
-speed used by that formula is held until the measured wind changes by at least
-`0.5 m/s`. This gives two target recalculations per `1 m/s` instead of reacting
-to every `0.1 m/s` update from the weather station.
+Wind reduction is applied to the already calculated target:
+`wind_target = base_target - (wind_speed - threshold) * reduction`.
+Then the wind target is clamped by the role limits:
+`wind_target = clamp(wind_target, min_percent, max_percent)`.
+For the windward window, `209 WINDOWS_WINDWARD_LAG_PERCENT` also limits the
+windward target relative to the leeward target. Storm, rain, and cold-close
+protections have priority over the wind min/max limits and may command a target
+outside those limits. The wind speed used by the formula is held until the
+measured wind changes by at least `1.0 m/s`. This gives one target recalculation
+per `1 m/s` instead of reacting to every `0.1 m/s` update from the weather
+station.
 - `223` WINDOWS_WEATHER_STALE_TIMEOUT_MS
 - `224` WINDOWS_WEATHER_SOURCE_AGE_S
 
@@ -319,6 +327,92 @@ to every `0.1 m/s` update from the weather station.
 - `bit3` undertray water temperature fault
 - `bit4` grow water temperature fault
 
+## Curtain Control, `243..274`
+- `243` CURTAIN_CTRL_MODE: `0=AUTO`, `1=MANUAL`, `2=OFF`
+- `244` CURTAIN_MANUAL_TARGET, `x10 %`
+- `245` CURTAIN_SCHEDULE_START_HHMM
+- `246` CURTAIN_SCHEDULE_END_HHMM
+- `247` CURTAIN_OUTSIDE_TARGET, `x10 %`, reserved for outside-schedule policy
+- `248` CURTAIN_MIN_POSITION, `x10 %`
+- `249` CURTAIN_MAX_POSITION, `x10 %`
+- `250` CURTAIN_POSITION_HYST, `x10 %`
+- `251` CURTAIN_RADIATION_THRESHOLD, `W/m2`
+- `252` CURTAIN_RADIATION_STEP_WM2, `W/m2`
+- `253` CURTAIN_RADIATION_STEP_PERCENT, `x10 %`; when radiation is active, target is `248 + step_count * 253`
+- `254` CURTAIN_RADIATION_HYST, `W/m2`
+- `255` CURTAIN_COLD_DELTA, `x10 C`; with `275`, cold target activates below `275 - 255 - 256` and releases at `275 - 255`
+- `256` CURTAIN_COLD_HYST, `x10 C`
+- `257` CURTAIN_COLD_TARGET, `x10 %`
+- `258` CURTAIN_HEAT_DELTA, `x10 C`; with `275`, heat target activates above `275 + 258 + 259` and releases at `275 + 258`
+- `259` CURTAIN_HEAT_HYST, `x10 C`
+- `260` CURTAIN_HEAT_TARGET, `x10 %`
+- `261` CURTAIN_HUM_LOW_DELTA, `x10 %RH`; with `276`, low-humidity target activates below `276 - 261 - 262` and releases at `276 - 261`
+- `262` CURTAIN_HUM_LOW_HYST, `x10 %RH`
+- `263` CURTAIN_HUM_LOW_TARGET, `x10 %`
+- `264` CURTAIN_HUM_HIGH_DELTA, `x10 %RH`; with `276`, high-humidity target activates above `276 + 264 + 265` and releases at `276 + 264`
+- `265` CURTAIN_HUM_HIGH_HYST, `x10 %RH`
+- `266` CURTAIN_HUM_HIGH_TARGET, `x10 %`
+- `267` CURTAIN_TARGET, `x10 %`, RO
+- `268` CURTAIN_BASE_TARGET, `x10 %`, RO
+- `269` CURTAIN_CURRENT_MA, `x10 mA`, RO
+- `270` CURTAIN_STATUS_BITS, RO
+- `271` CURTAIN_REASON_BITS, RO
+- `272` CURTAIN_POSITION_STATUS_BITS, RO
+- `273` CURTAIN_FAULT_CODE, RO
+- `274` CURTAIN_FAULT_RESET_TOKEN
+
+In AUTO mode, the curtain base target is register `248` (`CURTAIN_MIN_POSITION`).
+Active automatic rules assign their own target (`radiation`, `257`, `260`,
+`263`, or `266`). If no automatic rule is active, the target remains `248`.
+If several rules are active at the same time, target priority is:
+overheating (`260`) -> overcooling (`257`) -> high humidity (`266`) ->
+low humidity (`263`) -> radiation.
+
+## Global Greenhouse Targets, `275..276`
+- `275` AIR_TEMP_TARGET, `x10 C`; greenhouse air temperature target used by curtain and shared greenhouse control logic
+- `276` AIR_HUM_TARGET, `x10 %`; greenhouse air humidity target used by curtain and shared greenhouse control logic
+
+### Curtain Status Bits (`270`)
+- `bit0` output enabled
+- `bit1` manual mode
+- `bit2` auto mode
+- `bit3` off mode
+- `bit4` position valid
+- `bit5` moving open
+- `bit6` moving close
+- `bit7` at target
+- `bit8` fault active
+- `bit9` OPEN output active
+- `bit10` CLOSE output active
+
+### Curtain Reason Bits (`271`)
+- `bit0` schedule active
+- `bit1` radiation active
+- `bit2` cold close active
+- `bit3` heat open active
+- `bit4` humidity low open active
+- `bit5` humidity high close active
+- `bit6` manual mode
+- `bit7` outside schedule
+- `bit8` temperature sensor fault
+- `bit9` humidity sensor fault
+- `bit10` radiation fault
+- `bit11` time fault
+
+### Curtain Position Status Bits (`272`)
+- `bit0` position valid
+- `bit1` at target
+- `bit2` moving open
+- `bit3` moving close
+- `bit4` encoder fault
+- `bit5` no-motion fault
+
+### Curtain Fault Codes (`273`)
+- `0` NONE
+- `1` ENCODER
+- `2` NO_MOTION
+- `3` OUTPUT
+
 ### Window Protection Bits
 - `bit0` force safe active
 - `bit1` weather stale safe policy active
@@ -379,8 +473,8 @@ trigger weather safe closing.
 ### Commissioning And Service
 - `182` RLL400_TARGET_HYST_PERCENT, `x10 %`; used as motor deadband and
   effective-target stabilization deadband
-- `183` RLL400_MOTION_DELTA_PERCENT, `x10 %`
-- `184` RLL400_NO_MOTION_TIMEOUT_MS
+- `183` ACTUATOR_MOTION_DELTA_PERCENT, `x10 %`; shared by windows and curtain
+- `184` ACTUATOR_NO_MOTION_TIMEOUT_MS; shared by windows and curtain, `0` disables no-motion fault
 
 ### Usually Hide From The Operator Panel
 - `175` WINDOWS_WIND_LIMIT, legacy/default fallback
