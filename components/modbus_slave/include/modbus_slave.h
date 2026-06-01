@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define MODBUS_HREG_TOTAL_COUNT 310
+#define MODBUS_HREG_TOTAL_COUNT 337
 
 // Telemetry map (MUST): base + 0..8, int16 x10
 #define MODBUS_HREG_AIR_TEMP 0
@@ -253,6 +253,35 @@ extern "C" {
 #define MODBUS_HREG_CO2_DOSING_ELAPSED_S 308
 #define MODBUS_HREG_CO2_FAULT_RESET_TOKEN 309
 
+// Circulation fan control/runtime registers
+#define MODBUS_HREG_CIRC_CTRL_MODE 310
+#define MODBUS_HREG_CIRC_MANUAL_FAN_MASK 311
+#define MODBUS_HREG_CIRC_AVAILABLE_FAN_MASK 312
+#define MODBUS_HREG_CIRC_SCHEDULE_START_HHMM 313
+#define MODBUS_HREG_CIRC_SCHEDULE_END_HHMM 314
+#define MODBUS_HREG_CIRC_CO2_FAN_MASK 315
+#define MODBUS_HREG_CIRC_HEATING_FAN_MASK 316
+#define MODBUS_HREG_CIRC_HUMIDITY_FAN_MASK 317
+#define MODBUS_HREG_CIRC_DAY_FAN_MASK 318
+#define MODBUS_HREG_CIRC_NIGHT_FAN_MASK 319
+#define MODBUS_HREG_CIRC_VENT_LIMITED_FAN_MASK 320
+#define MODBUS_HREG_CIRC_VENT_LIMIT_PERCENT 321
+#define MODBUS_HREG_CIRC_VENT_CUTOFF_PERCENT 322
+#define MODBUS_HREG_CIRC_HUM_HIGH_DELTA 323
+#define MODBUS_HREG_CIRC_DAY_CYCLE_ON_S 324
+#define MODBUS_HREG_CIRC_DAY_CYCLE_OFF_S 325
+#define MODBUS_HREG_CIRC_NIGHT_CYCLE_ON_S 326
+#define MODBUS_HREG_CIRC_NIGHT_CYCLE_OFF_S 327
+#define MODBUS_HREG_CIRC_HUM_CYCLE_ON_S 328
+#define MODBUS_HREG_CIRC_HUM_CYCLE_OFF_S 329
+#define MODBUS_HREG_CIRC_MIN_ON_S 330
+#define MODBUS_HREG_CIRC_MIN_OFF_S 331
+#define MODBUS_HREG_CIRC_OUTPUT_FAN_MASK 332
+#define MODBUS_HREG_CIRC_STATUS_BITS 333
+#define MODBUS_HREG_CIRC_REASON_BITS 334
+#define MODBUS_HREG_CIRC_PROTECTION_BITS 335
+#define MODBUS_HREG_CIRC_REQUESTED_FAN_MASK 336
+
 typedef enum {
   MODBUS_MODE_REMOTE = 0,
   MODBUS_MODE_AUTONOMOUS = 1,
@@ -307,6 +336,12 @@ typedef enum {
   MODBUS_CO2_CTRL_MODE_OFF = 1,
   MODBUS_CO2_CTRL_MODE_MANUAL = 2,
 } modbus_co2_ctrl_mode_t;
+
+typedef enum {
+  MODBUS_CIRC_CTRL_MODE_AUTO = 0,
+  MODBUS_CIRC_CTRL_MODE_OFF = 1,
+  MODBUS_CIRC_CTRL_MODE_MANUAL = 2,
+} modbus_circulation_ctrl_mode_t;
 
 typedef enum {
   MODBUS_CURTAIN_CTRL_MODE_AUTO = 0,
@@ -521,6 +556,33 @@ void modbus_set_co2_runtime(uint16_t target_ppm, uint16_t effective_target_ppm,
                             uint16_t status_bits, uint16_t reason_bits,
                             uint16_t protection_bits, uint16_t fault_code,
                             uint16_t dosing_elapsed_s);
+modbus_circulation_ctrl_mode_t modbus_get_circulation_ctrl_mode(void);
+uint16_t modbus_get_circulation_manual_fan_mask(void);
+uint16_t modbus_get_circulation_available_fan_mask(void);
+uint16_t modbus_get_circulation_schedule_start_hhmm(void);
+uint16_t modbus_get_circulation_schedule_end_hhmm(void);
+uint16_t modbus_get_circulation_co2_fan_mask(void);
+uint16_t modbus_get_circulation_heating_fan_mask(void);
+uint16_t modbus_get_circulation_humidity_fan_mask(void);
+uint16_t modbus_get_circulation_day_fan_mask(void);
+uint16_t modbus_get_circulation_night_fan_mask(void);
+uint16_t modbus_get_circulation_vent_limited_fan_mask(void);
+uint16_t modbus_get_circulation_vent_limit_percent(void);
+uint16_t modbus_get_circulation_vent_cutoff_percent(void);
+uint16_t modbus_get_circulation_humidity_high_delta_percent(void);
+uint16_t modbus_get_circulation_day_cycle_on_s(void);
+uint16_t modbus_get_circulation_day_cycle_off_s(void);
+uint16_t modbus_get_circulation_night_cycle_on_s(void);
+uint16_t modbus_get_circulation_night_cycle_off_s(void);
+uint16_t modbus_get_circulation_humidity_cycle_on_s(void);
+uint16_t modbus_get_circulation_humidity_cycle_off_s(void);
+uint16_t modbus_get_circulation_min_on_s(void);
+uint16_t modbus_get_circulation_min_off_s(void);
+void modbus_set_circulation_runtime(uint16_t output_fan_mask,
+                                    uint16_t status_bits,
+                                    uint16_t reason_bits,
+                                    uint16_t protection_bits,
+                                    uint16_t requested_fan_mask);
 modbus_mode_state_t modbus_get_mode_state(void);
 bool modbus_is_autonomous(void);
 

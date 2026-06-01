@@ -140,6 +140,27 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_CO2_DEFAULT_TEMP_HIGH_DELTA 20U
 #define MODBUS_CO2_DEFAULT_TEMP_CRITICAL_DELTA 40U
 #define MODBUS_CO2_DEFAULT_HUM_HIGH_DELTA 50U
+#define MODBUS_CIRC_DEFAULT_CTRL_MODE MODBUS_CIRC_CTRL_MODE_OFF
+#define MODBUS_CIRC_DEFAULT_AVAILABLE_FAN_MASK 0x0003U
+#define MODBUS_CIRC_DEFAULT_SCHEDULE_START_HHMM 600U
+#define MODBUS_CIRC_DEFAULT_SCHEDULE_END_HHMM 2000U
+#define MODBUS_CIRC_DEFAULT_CO2_FAN_MASK 0x0003U
+#define MODBUS_CIRC_DEFAULT_HEATING_FAN_MASK 0x0003U
+#define MODBUS_CIRC_DEFAULT_HUMIDITY_FAN_MASK 0x0003U
+#define MODBUS_CIRC_DEFAULT_DAY_FAN_MASK 0x0001U
+#define MODBUS_CIRC_DEFAULT_NIGHT_FAN_MASK 0x0001U
+#define MODBUS_CIRC_DEFAULT_VENT_LIMITED_FAN_MASK 0x0001U
+#define MODBUS_CIRC_DEFAULT_VENT_LIMIT_PERCENT 500U
+#define MODBUS_CIRC_DEFAULT_VENT_CUTOFF_PERCENT 800U
+#define MODBUS_CIRC_DEFAULT_HUM_HIGH_DELTA 50U
+#define MODBUS_CIRC_DEFAULT_DAY_CYCLE_ON_S 300U
+#define MODBUS_CIRC_DEFAULT_DAY_CYCLE_OFF_S 900U
+#define MODBUS_CIRC_DEFAULT_NIGHT_CYCLE_ON_S 300U
+#define MODBUS_CIRC_DEFAULT_NIGHT_CYCLE_OFF_S 1800U
+#define MODBUS_CIRC_DEFAULT_HUM_CYCLE_ON_S 600U
+#define MODBUS_CIRC_DEFAULT_HUM_CYCLE_OFF_S 300U
+#define MODBUS_CIRC_DEFAULT_MIN_ON_S 30U
+#define MODBUS_CIRC_DEFAULT_MIN_OFF_S 30U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -2669,6 +2690,53 @@ void modbus_init(void) {
   s_holding_regs[MODBUS_HREG_CO2_FAULT_CODE] = 0U;
   s_holding_regs[MODBUS_HREG_CO2_DOSING_ELAPSED_S] = 0U;
   s_holding_regs[MODBUS_HREG_CO2_FAULT_RESET_TOKEN] = 0U;
+  s_holding_regs[MODBUS_HREG_CIRC_CTRL_MODE] = MODBUS_CIRC_DEFAULT_CTRL_MODE;
+  s_holding_regs[MODBUS_HREG_CIRC_MANUAL_FAN_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_CIRC_AVAILABLE_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_AVAILABLE_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_SCHEDULE_START_HHMM] =
+      MODBUS_CIRC_DEFAULT_SCHEDULE_START_HHMM;
+  s_holding_regs[MODBUS_HREG_CIRC_SCHEDULE_END_HHMM] =
+      MODBUS_CIRC_DEFAULT_SCHEDULE_END_HHMM;
+  s_holding_regs[MODBUS_HREG_CIRC_CO2_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_CO2_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_HEATING_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_HEATING_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_HUMIDITY_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_HUMIDITY_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_DAY_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_DAY_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_NIGHT_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_NIGHT_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_VENT_LIMITED_FAN_MASK] =
+      MODBUS_CIRC_DEFAULT_VENT_LIMITED_FAN_MASK;
+  s_holding_regs[MODBUS_HREG_CIRC_VENT_LIMIT_PERCENT] =
+      MODBUS_CIRC_DEFAULT_VENT_LIMIT_PERCENT;
+  s_holding_regs[MODBUS_HREG_CIRC_VENT_CUTOFF_PERCENT] =
+      MODBUS_CIRC_DEFAULT_VENT_CUTOFF_PERCENT;
+  s_holding_regs[MODBUS_HREG_CIRC_HUM_HIGH_DELTA] =
+      MODBUS_CIRC_DEFAULT_HUM_HIGH_DELTA;
+  s_holding_regs[MODBUS_HREG_CIRC_DAY_CYCLE_ON_S] =
+      MODBUS_CIRC_DEFAULT_DAY_CYCLE_ON_S;
+  s_holding_regs[MODBUS_HREG_CIRC_DAY_CYCLE_OFF_S] =
+      MODBUS_CIRC_DEFAULT_DAY_CYCLE_OFF_S;
+  s_holding_regs[MODBUS_HREG_CIRC_NIGHT_CYCLE_ON_S] =
+      MODBUS_CIRC_DEFAULT_NIGHT_CYCLE_ON_S;
+  s_holding_regs[MODBUS_HREG_CIRC_NIGHT_CYCLE_OFF_S] =
+      MODBUS_CIRC_DEFAULT_NIGHT_CYCLE_OFF_S;
+  s_holding_regs[MODBUS_HREG_CIRC_HUM_CYCLE_ON_S] =
+      MODBUS_CIRC_DEFAULT_HUM_CYCLE_ON_S;
+  s_holding_regs[MODBUS_HREG_CIRC_HUM_CYCLE_OFF_S] =
+      MODBUS_CIRC_DEFAULT_HUM_CYCLE_OFF_S;
+  s_holding_regs[MODBUS_HREG_CIRC_MIN_ON_S] =
+      MODBUS_CIRC_DEFAULT_MIN_ON_S;
+  s_holding_regs[MODBUS_HREG_CIRC_MIN_OFF_S] =
+      MODBUS_CIRC_DEFAULT_MIN_OFF_S;
+  s_holding_regs[MODBUS_HREG_CIRC_OUTPUT_FAN_MASK] = 0U;
+  s_holding_regs[MODBUS_HREG_CIRC_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CIRC_REASON_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CIRC_PROTECTION_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CIRC_REQUESTED_FAN_MASK] = 0U;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_apply_pending = false;
@@ -5359,6 +5427,114 @@ void modbus_set_co2_runtime(uint16_t target_ppm, uint16_t effective_target_ppm,
   modbus_write_holding_reg(MODBUS_HREG_CO2_FAULT_CODE, fault_code);
   modbus_write_holding_reg(MODBUS_HREG_CO2_DOSING_ELAPSED_S,
                            dosing_elapsed_s);
+}
+
+modbus_circulation_ctrl_mode_t modbus_get_circulation_ctrl_mode(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_CIRC_CTRL_MODE);
+  if (raw == (uint16_t)MODBUS_CIRC_CTRL_MODE_MANUAL) {
+    return MODBUS_CIRC_CTRL_MODE_MANUAL;
+  }
+  if (raw == (uint16_t)MODBUS_CIRC_CTRL_MODE_AUTO) {
+    return MODBUS_CIRC_CTRL_MODE_AUTO;
+  }
+  return MODBUS_CIRC_CTRL_MODE_OFF;
+}
+
+uint16_t modbus_get_circulation_manual_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_MANUAL_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_available_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_AVAILABLE_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_schedule_start_hhmm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_SCHEDULE_START_HHMM);
+}
+
+uint16_t modbus_get_circulation_schedule_end_hhmm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_SCHEDULE_END_HHMM);
+}
+
+uint16_t modbus_get_circulation_co2_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_CO2_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_heating_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_HEATING_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_humidity_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_HUMIDITY_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_day_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_DAY_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_night_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_NIGHT_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_vent_limited_fan_mask(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_VENT_LIMITED_FAN_MASK);
+}
+
+uint16_t modbus_get_circulation_vent_limit_percent(void) {
+  return modbus_get_co2_percent_reg(MODBUS_HREG_CIRC_VENT_LIMIT_PERCENT);
+}
+
+uint16_t modbus_get_circulation_vent_cutoff_percent(void) {
+  return modbus_get_co2_percent_reg(MODBUS_HREG_CIRC_VENT_CUTOFF_PERCENT);
+}
+
+uint16_t modbus_get_circulation_humidity_high_delta_percent(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_HUM_HIGH_DELTA);
+}
+
+uint16_t modbus_get_circulation_day_cycle_on_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_DAY_CYCLE_ON_S);
+}
+
+uint16_t modbus_get_circulation_day_cycle_off_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_DAY_CYCLE_OFF_S);
+}
+
+uint16_t modbus_get_circulation_night_cycle_on_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_NIGHT_CYCLE_ON_S);
+}
+
+uint16_t modbus_get_circulation_night_cycle_off_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_NIGHT_CYCLE_OFF_S);
+}
+
+uint16_t modbus_get_circulation_humidity_cycle_on_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_HUM_CYCLE_ON_S);
+}
+
+uint16_t modbus_get_circulation_humidity_cycle_off_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_HUM_CYCLE_OFF_S);
+}
+
+uint16_t modbus_get_circulation_min_on_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_MIN_ON_S);
+}
+
+uint16_t modbus_get_circulation_min_off_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CIRC_MIN_OFF_S);
+}
+
+void modbus_set_circulation_runtime(uint16_t output_fan_mask,
+                                    uint16_t status_bits,
+                                    uint16_t reason_bits,
+                                    uint16_t protection_bits,
+                                    uint16_t requested_fan_mask) {
+  modbus_write_holding_reg(MODBUS_HREG_CIRC_OUTPUT_FAN_MASK, output_fan_mask);
+  modbus_write_holding_reg(MODBUS_HREG_CIRC_STATUS_BITS, status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CIRC_REASON_BITS, reason_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CIRC_PROTECTION_BITS, protection_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CIRC_REQUESTED_FAN_MASK,
+                           requested_fan_mask);
 }
 
 modbus_mode_state_t modbus_get_mode_state(void) {

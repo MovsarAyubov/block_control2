@@ -84,7 +84,7 @@ typedef struct {
   uint16_t effective_target_ppm;
   uint16_t measured_ppm;
   bool valve_open;
-  bool fan_on;
+  bool mixing_requested;
   uint16_t status_bits;
   uint16_t reason_bits;
   uint16_t active_protection_bits;
@@ -98,7 +98,7 @@ typedef struct {
 #define CO2_CONTROLLER_STATUS_OFF_MODE (1U << 2)
 #define CO2_CONTROLLER_STATUS_MANUAL_MODE (1U << 3)
 #define CO2_CONTROLLER_STATUS_VALVE_OPEN (1U << 4)
-#define CO2_CONTROLLER_STATUS_FAN_ON (1U << 5)
+#define CO2_CONTROLLER_STATUS_MIX_REQUEST (1U << 5)
 #define CO2_CONTROLLER_STATUS_SENSOR_VALID (1U << 6)
 #define CO2_CONTROLLER_STATUS_FAULT (1U << 7)
 #define CO2_CONTROLLER_STATUS_DOSING_HOLD (1U << 8)

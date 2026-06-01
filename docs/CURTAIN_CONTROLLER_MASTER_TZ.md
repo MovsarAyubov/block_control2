@@ -180,7 +180,8 @@
 (`260`) -> переохлаждение (`257`) -> высокая влажность (`266`) -> низкая
 влажность (`263`) -> радиация.
 
-`MODBUS_HREG_TOTAL_COUNT = 277`.
+`MODBUS_HREG_TOTAL_COUNT` now extends beyond the curtain block because later
+blocks are used by shared greenhouse targets, CO2 control, and circulation fans.
 
 ### 6.2 Статусы `CURTAIN_STATUS_BITS`
 

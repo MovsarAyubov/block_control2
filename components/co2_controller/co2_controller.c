@@ -111,7 +111,7 @@ esp_err_t co2_controller_process(co2_controller_handle_t handle,
   status.effective_target_ppm = 0U;
   status.measured_ppm = inputs->co2_ppm;
   status.valve_open = false;
-  status.fan_on = false;
+  status.mixing_requested = false;
   status.status_bits = 0U;
   status.reason_bits = 0U;
   status.active_protection_bits = 0U;
@@ -145,13 +145,13 @@ esp_err_t co2_controller_process(co2_controller_handle_t handle,
     status.status_bits |= CO2_CONTROLLER_STATUS_MANUAL_MODE;
     status.valve_open = settings->manual_valve_open &&
                         status.fault_code == CO2_CONTROLLER_FAULT_NONE;
-    status.fan_on = settings->manual_fan_on || status.valve_open;
+    status.mixing_requested = settings->manual_fan_on || status.valve_open;
     if (status.valve_open) {
       status.status_bits |= CO2_CONTROLLER_STATUS_ENABLED |
                             CO2_CONTROLLER_STATUS_VALVE_OPEN;
     }
-    if (status.fan_on) {
-      status.status_bits |= CO2_CONTROLLER_STATUS_FAN_ON;
+    if (status.mixing_requested) {
+      status.status_bits |= CO2_CONTROLLER_STATUS_MIX_REQUEST;
     }
     if (handle->dosing_active && !status.valve_open) {
       handle->last_dosing_stop_us = now_us;
@@ -320,13 +320,13 @@ esp_err_t co2_controller_process(co2_controller_handle_t handle,
   }
 
   status.valve_open = handle->dosing_active;
-  status.fan_on = handle->dosing_active;
+  status.mixing_requested = handle->dosing_active;
   if (status.valve_open) {
     status.status_bits |= CO2_CONTROLLER_STATUS_ENABLED |
                           CO2_CONTROLLER_STATUS_VALVE_OPEN;
   }
-  if (status.fan_on) {
-    status.status_bits |= CO2_CONTROLLER_STATUS_FAN_ON;
+  if (status.mixing_requested) {
+    status.status_bits |= CO2_CONTROLLER_STATUS_MIX_REQUEST;
   }
   if (status.fault_code != CO2_CONTROLLER_FAULT_NONE) {
     status.status_bits |= CO2_CONTROLLER_STATUS_FAULT;

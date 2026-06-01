@@ -87,8 +87,9 @@
 - `bit14` -> Curtain `OPEN`
 - `bit15` -> Curtain `CLOSE`
 - `bit16` -> CO2 dosing valve
-- `bit17` -> CO2 recirculation fan
-- `bit18..23` -> reserved
+- `bit17` -> Circulation fan group A
+- `bit18` -> Circulation fan group B
+- `bit19..23` -> reserved
 - Valve outputs have an interlock: `OPEN` and `CLOSE` for the same valve are never driven together.
 
 ### Bluetooth ASCII aliases for autonomous setpoints
@@ -378,7 +379,7 @@ low humidity (`263`) -> radiation.
 - `277` CO2_MEASURED_PPM, RW; external/local CO2 sensor value in ppm
 - `278` CO2_SENSOR_VALID, RW; `0=invalid`, non-zero valid
 - `279` CO2_CTRL_MODE: `0=AUTO`, `1=OFF`, `2=MANUAL`; default `OFF`
-- `280` CO2_MANUAL_OUTPUTS; `bit0=valve`, `bit1=recirculation fan`
+- `280` CO2_MANUAL_OUTPUTS; `bit0=valve`, `bit1=mixing request`
 - `281` CO2_SCHEDULE_START_HHMM
 - `282` CO2_SCHEDULE_END_HHMM
 - `283` CO2_LOW_LIGHT_THRESHOLD_WM2
@@ -409,9 +410,10 @@ low humidity (`263`) -> radiation.
 - `308` CO2_DOSING_ELAPSED_S, RO
 - `309` CO2_FAULT_RESET_TOKEN
 
-CO2 uses `74HC595 bit16` for the dosing valve and `bit17` for the
-recirculation fan. In AUTO, CO2 is subordinate to safety, temperature,
-humidity and ventilation: night/outside schedule, invalid sensor, excessive
+CO2 uses `74HC595 bit16` for the dosing valve. Circulation fans are controlled
+by the separate circulation controller, which uses CO2 dosing state as one of
+its inputs. In AUTO, CO2 is subordinate to safety, temperature, humidity and
+ventilation: night/outside schedule, invalid sensor, excessive
 temperature/humidity, external alarm, overrange, or strongly opened windows
 block dosing. Unknown window position is treated as open ventilation. The
 controller uses hysteresis around the dynamic target and guards against endless
@@ -423,7 +425,7 @@ dosing with max-time and no-rise checks.
 - `bit2` off mode
 - `bit3` manual mode
 - `bit4` valve open
-- `bit5` recirculation fan on
+- `bit5` mixing requested; circulation controller may use this as an input
 - `bit6` CO2 sensor valid
 - `bit7` fault active
 - `bit8` dosing timer active
@@ -441,6 +443,69 @@ dosing with max-time and no-rise checks.
 - `bit8` max dosing time reached
 - `bit9` min pause active
 - `bit10` no CO2 rise detected
+
+## Circulation Fan Control/Runtime, `310..336`
+- `310` CIRC_CTRL_MODE: `0=AUTO`, `1=OFF`, `2=MANUAL`; default `OFF`
+- `311` CIRC_MANUAL_FAN_MASK; `bit0=group A`, `bit1=group B`
+- `312` CIRC_AVAILABLE_FAN_MASK; default `0x0003`
+- `313` CIRC_SCHEDULE_START_HHMM
+- `314` CIRC_SCHEDULE_END_HHMM
+- `315` CIRC_CO2_FAN_MASK
+- `316` CIRC_HEATING_FAN_MASK
+- `317` CIRC_HUMIDITY_FAN_MASK
+- `318` CIRC_DAY_FAN_MASK
+- `319` CIRC_NIGHT_FAN_MASK
+- `320` CIRC_VENT_LIMITED_FAN_MASK
+- `321` CIRC_VENT_LIMIT_PERCENT, `x10 %`
+- `322` CIRC_VENT_CUTOFF_PERCENT, `x10 %`
+- `323` CIRC_HUM_HIGH_DELTA, `x10 %RH`
+- `324` CIRC_DAY_CYCLE_ON_S
+- `325` CIRC_DAY_CYCLE_OFF_S
+- `326` CIRC_NIGHT_CYCLE_ON_S
+- `327` CIRC_NIGHT_CYCLE_OFF_S
+- `328` CIRC_HUM_CYCLE_ON_S
+- `329` CIRC_HUM_CYCLE_OFF_S
+- `330` CIRC_MIN_ON_S
+- `331` CIRC_MIN_OFF_S
+- `332` CIRC_OUTPUT_FAN_MASK, RO
+- `333` CIRC_STATUS_BITS, RO
+- `334` CIRC_REASON_BITS, RO
+- `335` CIRC_PROTECTION_BITS, RO
+- `336` CIRC_REQUESTED_FAN_MASK, RO
+
+In AUTO, circulation is a climate-controller module, not a CO2 subfeature.
+Priority is: manual/off mode, CO2 dosing, active heating, high humidity,
+day/night base cycling, then ventilation limits. When windows are unknown or
+strongly open, the output mask is reduced to `320` so circulation does not fight
+natural ventilation. Relay protection uses `330..331` min on/off timers.
+
+### Circulation Status Bits (`333`)
+- `bit0` enabled
+- `bit1` auto mode
+- `bit2` off mode
+- `bit3` manual mode
+- `bit4` cycle phase is on
+- `bit5` min-on hold active
+- `bit6` min-off hold active
+- `bit7` time valid
+
+### Circulation Reason Bits (`334`)
+- `bit0` CO2 dosing
+- `bit1` heating active
+- `bit2` high humidity
+- `bit3` day base cycle
+- `bit4` night cycle
+- `bit5` manual
+- `bit6` outside schedule
+- `bit7` time fault
+- `bit8` humidity fault
+
+### Circulation Protection Bits (`335`)
+- `bit0` ventilation limited
+- `bit1` ventilation cutoff
+- `bit2` unknown ventilation position
+- `bit3` min-on hold
+- `bit4` min-off hold
 
 ### Curtain Status Bits (`270`)
 - `bit0` output enabled
