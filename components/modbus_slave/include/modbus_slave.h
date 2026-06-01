@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define MODBUS_HREG_TOTAL_COUNT 277
+#define MODBUS_HREG_TOTAL_COUNT 310
 
 // Telemetry map (MUST): base + 0..8, int16 x10
 #define MODBUS_HREG_AIR_TEMP 0
@@ -218,6 +218,41 @@ extern "C" {
 #define MODBUS_HREG_AIR_TEMP_TARGET 275
 #define MODBUS_HREG_AIR_HUM_TARGET 276
 
+// CO2 control/runtime registers
+#define MODBUS_HREG_CO2_MEASURED_PPM 277
+#define MODBUS_HREG_CO2_SENSOR_VALID 278
+#define MODBUS_HREG_CO2_CTRL_MODE 279
+#define MODBUS_HREG_CO2_MANUAL_OUTPUTS 280
+#define MODBUS_HREG_CO2_SCHEDULE_START_HHMM 281
+#define MODBUS_HREG_CO2_SCHEDULE_END_HHMM 282
+#define MODBUS_HREG_CO2_LOW_LIGHT_THRESHOLD_WM2 283
+#define MODBUS_HREG_CO2_MID_LIGHT_THRESHOLD_WM2 284
+#define MODBUS_HREG_CO2_HIGH_LIGHT_THRESHOLD_WM2 285
+#define MODBUS_HREG_CO2_LOW_LIGHT_TARGET_PPM 286
+#define MODBUS_HREG_CO2_MID_LIGHT_TARGET_PPM 287
+#define MODBUS_HREG_CO2_HIGH_LIGHT_TARGET_PPM 288
+#define MODBUS_HREG_CO2_VENT_LIMIT_LOW_PERCENT 289
+#define MODBUS_HREG_CO2_VENT_LIMIT_HIGH_PERCENT 290
+#define MODBUS_HREG_CO2_VENT_CUTOFF_PERCENT 291
+#define MODBUS_HREG_CO2_DOSING_HYST_PPM 292
+#define MODBUS_HREG_CO2_MAX_SAFE_PPM 293
+#define MODBUS_HREG_CO2_MAX_DOSING_TIME_S 294
+#define MODBUS_HREG_CO2_MIN_PAUSE_TIME_S 295
+#define MODBUS_HREG_CO2_NO_RISE_CHECK_TIME_S 296
+#define MODBUS_HREG_CO2_NO_RISE_MIN_DELTA_PPM 297
+#define MODBUS_HREG_CO2_TEMP_HIGH_DELTA 298
+#define MODBUS_HREG_CO2_TEMP_CRITICAL_DELTA 299
+#define MODBUS_HREG_CO2_HUM_HIGH_DELTA 300
+#define MODBUS_HREG_CO2_EXTERNAL_ALARM 301
+#define MODBUS_HREG_CO2_TARGET_PPM 302
+#define MODBUS_HREG_CO2_EFFECTIVE_TARGET_PPM 303
+#define MODBUS_HREG_CO2_STATUS_BITS 304
+#define MODBUS_HREG_CO2_REASON_BITS 305
+#define MODBUS_HREG_CO2_PROTECTION_BITS 306
+#define MODBUS_HREG_CO2_FAULT_CODE 307
+#define MODBUS_HREG_CO2_DOSING_ELAPSED_S 308
+#define MODBUS_HREG_CO2_FAULT_RESET_TOKEN 309
+
 typedef enum {
   MODBUS_MODE_REMOTE = 0,
   MODBUS_MODE_AUTONOMOUS = 1,
@@ -266,6 +301,12 @@ typedef enum {
   MODBUS_HEATING_CTRL_MODE_OFF = 1,
   MODBUS_HEATING_CTRL_MODE_MANUAL = 2,
 } modbus_heating_ctrl_mode_t;
+
+typedef enum {
+  MODBUS_CO2_CTRL_MODE_AUTO = 0,
+  MODBUS_CO2_CTRL_MODE_OFF = 1,
+  MODBUS_CO2_CTRL_MODE_MANUAL = 2,
+} modbus_co2_ctrl_mode_t;
 
 typedef enum {
   MODBUS_CURTAIN_CTRL_MODE_AUTO = 0,
@@ -450,6 +491,36 @@ void modbus_set_heating_runtime(uint16_t status_bits, uint16_t active_stage,
                                 uint16_t pump_mask, uint16_t valve_open_mask,
                                 uint16_t valve_close_mask,
                                 uint16_t sensor_status_bits);
+uint16_t modbus_get_co2_measured_ppm(void);
+bool modbus_get_co2_sensor_valid(void);
+modbus_co2_ctrl_mode_t modbus_get_co2_ctrl_mode(void);
+uint16_t modbus_get_co2_manual_outputs(void);
+uint16_t modbus_get_co2_schedule_start_hhmm(void);
+uint16_t modbus_get_co2_schedule_end_hhmm(void);
+uint16_t modbus_get_co2_low_light_threshold_wm2(void);
+uint16_t modbus_get_co2_mid_light_threshold_wm2(void);
+uint16_t modbus_get_co2_high_light_threshold_wm2(void);
+uint16_t modbus_get_co2_low_light_target_ppm(void);
+uint16_t modbus_get_co2_mid_light_target_ppm(void);
+uint16_t modbus_get_co2_high_light_target_ppm(void);
+uint16_t modbus_get_co2_vent_limit_low_percent(void);
+uint16_t modbus_get_co2_vent_limit_high_percent(void);
+uint16_t modbus_get_co2_vent_cutoff_percent(void);
+uint16_t modbus_get_co2_dosing_hysteresis_ppm(void);
+uint16_t modbus_get_co2_max_safe_ppm(void);
+uint16_t modbus_get_co2_max_dosing_time_s(void);
+uint16_t modbus_get_co2_min_pause_time_s(void);
+uint16_t modbus_get_co2_no_rise_check_time_s(void);
+uint16_t modbus_get_co2_no_rise_min_delta_ppm(void);
+float modbus_get_co2_temp_high_delta_c(void);
+float modbus_get_co2_temp_critical_delta_c(void);
+float modbus_get_co2_humidity_high_delta_percent(void);
+bool modbus_get_co2_external_alarm(void);
+uint16_t modbus_get_co2_fault_reset_token(void);
+void modbus_set_co2_runtime(uint16_t target_ppm, uint16_t effective_target_ppm,
+                            uint16_t status_bits, uint16_t reason_bits,
+                            uint16_t protection_bits, uint16_t fault_code,
+                            uint16_t dosing_elapsed_s);
 modbus_mode_state_t modbus_get_mode_state(void);
 bool modbus_is_autonomous(void);
 

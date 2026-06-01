@@ -86,7 +86,9 @@
 - `bit13` -> Grow pipe pump contactor
 - `bit14` -> Curtain `OPEN`
 - `bit15` -> Curtain `CLOSE`
-- `bit16..23` -> reserved
+- `bit16` -> CO2 dosing valve
+- `bit17` -> CO2 recirculation fan
+- `bit18..23` -> reserved
 - Valve outputs have an interlock: `OPEN` and `CLOSE` for the same valve are never driven together.
 
 ### Bluetooth ASCII aliases for autonomous setpoints
@@ -371,6 +373,74 @@ low humidity (`263`) -> radiation.
 ## Global Greenhouse Targets, `275..276`
 - `275` AIR_TEMP_TARGET, `x10 C`; greenhouse air temperature target used by curtain and shared greenhouse control logic
 - `276` AIR_HUM_TARGET, `x10 %`; greenhouse air humidity target used by curtain and shared greenhouse control logic
+
+## CO2 Control/Runtime, `277..309`
+- `277` CO2_MEASURED_PPM, RW; external/local CO2 sensor value in ppm
+- `278` CO2_SENSOR_VALID, RW; `0=invalid`, non-zero valid
+- `279` CO2_CTRL_MODE: `0=AUTO`, `1=OFF`, `2=MANUAL`; default `OFF`
+- `280` CO2_MANUAL_OUTPUTS; `bit0=valve`, `bit1=recirculation fan`
+- `281` CO2_SCHEDULE_START_HHMM
+- `282` CO2_SCHEDULE_END_HHMM
+- `283` CO2_LOW_LIGHT_THRESHOLD_WM2
+- `284` CO2_MID_LIGHT_THRESHOLD_WM2
+- `285` CO2_HIGH_LIGHT_THRESHOLD_WM2
+- `286` CO2_LOW_LIGHT_TARGET_PPM
+- `287` CO2_MID_LIGHT_TARGET_PPM
+- `288` CO2_HIGH_LIGHT_TARGET_PPM
+- `289` CO2_VENT_LIMIT_LOW_PERCENT, `x10 %`
+- `290` CO2_VENT_LIMIT_HIGH_PERCENT, `x10 %`
+- `291` CO2_VENT_CUTOFF_PERCENT, `x10 %`
+- `292` CO2_DOSING_HYST_PPM
+- `293` CO2_MAX_SAFE_PPM
+- `294` CO2_MAX_DOSING_TIME_S
+- `295` CO2_MIN_PAUSE_TIME_S
+- `296` CO2_NO_RISE_CHECK_TIME_S
+- `297` CO2_NO_RISE_MIN_DELTA_PPM
+- `298` CO2_TEMP_HIGH_DELTA, `x10 C`
+- `299` CO2_TEMP_CRITICAL_DELTA, `x10 C`
+- `300` CO2_HUM_HIGH_DELTA, `x10 %RH`
+- `301` CO2_EXTERNAL_ALARM, RW; non-zero blocks CO2
+- `302` CO2_TARGET_PPM, RO
+- `303` CO2_EFFECTIVE_TARGET_PPM, RO; `0` when blocked
+- `304` CO2_STATUS_BITS, RO
+- `305` CO2_REASON_BITS, RO
+- `306` CO2_PROTECTION_BITS, RO
+- `307` CO2_FAULT_CODE, RO
+- `308` CO2_DOSING_ELAPSED_S, RO
+- `309` CO2_FAULT_RESET_TOKEN
+
+CO2 uses `74HC595 bit16` for the dosing valve and `bit17` for the
+recirculation fan. In AUTO, CO2 is subordinate to safety, temperature,
+humidity and ventilation: night/outside schedule, invalid sensor, excessive
+temperature/humidity, external alarm, overrange, or strongly opened windows
+block dosing. Unknown window position is treated as open ventilation. The
+controller uses hysteresis around the dynamic target and guards against endless
+dosing with max-time and no-rise checks.
+
+### CO2 Status Bits (`304`)
+- `bit0` enabled
+- `bit1` auto mode
+- `bit2` off mode
+- `bit3` manual mode
+- `bit4` valve open
+- `bit5` recirculation fan on
+- `bit6` CO2 sensor valid
+- `bit7` fault active
+- `bit8` dosing timer active
+- `bit9` pause hold active
+
+### CO2 Protection Bits (`306`)
+- `bit0` external alarm
+- `bit1` CO2 sensor fault
+- `bit2` over max safe ppm
+- `bit3` outside schedule/night
+- `bit4` critical high temperature
+- `bit5` high temperature limiting
+- `bit6` high humidity
+- `bit7` ventilation cutoff
+- `bit8` max dosing time reached
+- `bit9` min pause active
+- `bit10` no CO2 rise detected
 
 ### Curtain Status Bits (`270`)
 - `bit0` output enabled

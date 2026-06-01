@@ -119,6 +119,27 @@ static const char *TAG = "MB_SLAVE";
 #define MODBUS_CURTAIN_DEFAULT_HUM_HIGH_THRESHOLD 80U
 #define MODBUS_CURTAIN_DEFAULT_HUM_HIGH_HYST 20U
 #define MODBUS_CURTAIN_DEFAULT_HUM_HIGH_TARGET 0U
+#define MODBUS_CO2_DEFAULT_CTRL_MODE MODBUS_CO2_CTRL_MODE_OFF
+#define MODBUS_CO2_DEFAULT_SCHEDULE_START_HHMM 600U
+#define MODBUS_CO2_DEFAULT_SCHEDULE_END_HHMM 2000U
+#define MODBUS_CO2_DEFAULT_LOW_LIGHT_THRESHOLD_WM2 150U
+#define MODBUS_CO2_DEFAULT_MID_LIGHT_THRESHOLD_WM2 350U
+#define MODBUS_CO2_DEFAULT_HIGH_LIGHT_THRESHOLD_WM2 600U
+#define MODBUS_CO2_DEFAULT_LOW_LIGHT_TARGET_PPM 500U
+#define MODBUS_CO2_DEFAULT_MID_LIGHT_TARGET_PPM 700U
+#define MODBUS_CO2_DEFAULT_HIGH_LIGHT_TARGET_PPM 900U
+#define MODBUS_CO2_DEFAULT_VENT_LIMIT_LOW_PERCENT 100U
+#define MODBUS_CO2_DEFAULT_VENT_LIMIT_HIGH_PERCENT 300U
+#define MODBUS_CO2_DEFAULT_VENT_CUTOFF_PERCENT 400U
+#define MODBUS_CO2_DEFAULT_DOSING_HYST_PPM 50U
+#define MODBUS_CO2_DEFAULT_MAX_SAFE_PPM 1200U
+#define MODBUS_CO2_DEFAULT_MAX_DOSING_TIME_S 300U
+#define MODBUS_CO2_DEFAULT_MIN_PAUSE_TIME_S 30U
+#define MODBUS_CO2_DEFAULT_NO_RISE_CHECK_TIME_S 90U
+#define MODBUS_CO2_DEFAULT_NO_RISE_MIN_DELTA_PPM 30U
+#define MODBUS_CO2_DEFAULT_TEMP_HIGH_DELTA 20U
+#define MODBUS_CO2_DEFAULT_TEMP_CRITICAL_DELTA 40U
+#define MODBUS_CO2_DEFAULT_HUM_HIGH_DELTA 50U
 
 #define MODBUS_NVS_NAMESPACE "modbus"
 #define MODBUS_NVS_KEY_SLAVE_ID "slave_id"
@@ -2595,6 +2616,59 @@ void modbus_init(void) {
       MODBUS_WINDOWS_DEFAULT_TEMP_SETPOINT;
   s_holding_regs[MODBUS_HREG_AIR_HUM_TARGET] =
       MODBUS_WINDOWS_DEFAULT_HUM_SETPOINT;
+  s_holding_regs[MODBUS_HREG_CO2_MEASURED_PPM] = 420U;
+  s_holding_regs[MODBUS_HREG_CO2_SENSOR_VALID] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_CTRL_MODE] = MODBUS_CO2_DEFAULT_CTRL_MODE;
+  s_holding_regs[MODBUS_HREG_CO2_MANUAL_OUTPUTS] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_SCHEDULE_START_HHMM] =
+      MODBUS_CO2_DEFAULT_SCHEDULE_START_HHMM;
+  s_holding_regs[MODBUS_HREG_CO2_SCHEDULE_END_HHMM] =
+      MODBUS_CO2_DEFAULT_SCHEDULE_END_HHMM;
+  s_holding_regs[MODBUS_HREG_CO2_LOW_LIGHT_THRESHOLD_WM2] =
+      MODBUS_CO2_DEFAULT_LOW_LIGHT_THRESHOLD_WM2;
+  s_holding_regs[MODBUS_HREG_CO2_MID_LIGHT_THRESHOLD_WM2] =
+      MODBUS_CO2_DEFAULT_MID_LIGHT_THRESHOLD_WM2;
+  s_holding_regs[MODBUS_HREG_CO2_HIGH_LIGHT_THRESHOLD_WM2] =
+      MODBUS_CO2_DEFAULT_HIGH_LIGHT_THRESHOLD_WM2;
+  s_holding_regs[MODBUS_HREG_CO2_LOW_LIGHT_TARGET_PPM] =
+      MODBUS_CO2_DEFAULT_LOW_LIGHT_TARGET_PPM;
+  s_holding_regs[MODBUS_HREG_CO2_MID_LIGHT_TARGET_PPM] =
+      MODBUS_CO2_DEFAULT_MID_LIGHT_TARGET_PPM;
+  s_holding_regs[MODBUS_HREG_CO2_HIGH_LIGHT_TARGET_PPM] =
+      MODBUS_CO2_DEFAULT_HIGH_LIGHT_TARGET_PPM;
+  s_holding_regs[MODBUS_HREG_CO2_VENT_LIMIT_LOW_PERCENT] =
+      MODBUS_CO2_DEFAULT_VENT_LIMIT_LOW_PERCENT;
+  s_holding_regs[MODBUS_HREG_CO2_VENT_LIMIT_HIGH_PERCENT] =
+      MODBUS_CO2_DEFAULT_VENT_LIMIT_HIGH_PERCENT;
+  s_holding_regs[MODBUS_HREG_CO2_VENT_CUTOFF_PERCENT] =
+      MODBUS_CO2_DEFAULT_VENT_CUTOFF_PERCENT;
+  s_holding_regs[MODBUS_HREG_CO2_DOSING_HYST_PPM] =
+      MODBUS_CO2_DEFAULT_DOSING_HYST_PPM;
+  s_holding_regs[MODBUS_HREG_CO2_MAX_SAFE_PPM] =
+      MODBUS_CO2_DEFAULT_MAX_SAFE_PPM;
+  s_holding_regs[MODBUS_HREG_CO2_MAX_DOSING_TIME_S] =
+      MODBUS_CO2_DEFAULT_MAX_DOSING_TIME_S;
+  s_holding_regs[MODBUS_HREG_CO2_MIN_PAUSE_TIME_S] =
+      MODBUS_CO2_DEFAULT_MIN_PAUSE_TIME_S;
+  s_holding_regs[MODBUS_HREG_CO2_NO_RISE_CHECK_TIME_S] =
+      MODBUS_CO2_DEFAULT_NO_RISE_CHECK_TIME_S;
+  s_holding_regs[MODBUS_HREG_CO2_NO_RISE_MIN_DELTA_PPM] =
+      MODBUS_CO2_DEFAULT_NO_RISE_MIN_DELTA_PPM;
+  s_holding_regs[MODBUS_HREG_CO2_TEMP_HIGH_DELTA] =
+      MODBUS_CO2_DEFAULT_TEMP_HIGH_DELTA;
+  s_holding_regs[MODBUS_HREG_CO2_TEMP_CRITICAL_DELTA] =
+      MODBUS_CO2_DEFAULT_TEMP_CRITICAL_DELTA;
+  s_holding_regs[MODBUS_HREG_CO2_HUM_HIGH_DELTA] =
+      MODBUS_CO2_DEFAULT_HUM_HIGH_DELTA;
+  s_holding_regs[MODBUS_HREG_CO2_EXTERNAL_ALARM] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_TARGET_PPM] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_EFFECTIVE_TARGET_PPM] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_STATUS_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_REASON_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_PROTECTION_BITS] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_FAULT_CODE] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_DOSING_ELAPSED_S] = 0U;
+  s_holding_regs[MODBUS_HREG_CO2_FAULT_RESET_TOKEN] = 0U;
 
   s_last_apply_status = MODBUS_APPLY_OK;
   s_apply_pending = false;
@@ -5148,6 +5222,143 @@ void modbus_set_heating_runtime(uint16_t status_bits, uint16_t active_stage,
                            valve_close_mask);
   modbus_write_holding_reg(MODBUS_HREG_HEATING_SENSOR_STATUS_BITS,
                            sensor_status_bits);
+}
+
+uint16_t modbus_get_co2_measured_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MEASURED_PPM);
+}
+
+bool modbus_get_co2_sensor_valid(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_SENSOR_VALID) != 0U;
+}
+
+modbus_co2_ctrl_mode_t modbus_get_co2_ctrl_mode(void) {
+  const uint16_t raw = modbus_read_holding_reg(MODBUS_HREG_CO2_CTRL_MODE);
+  if (raw == (uint16_t)MODBUS_CO2_CTRL_MODE_MANUAL) {
+    return MODBUS_CO2_CTRL_MODE_MANUAL;
+  }
+  if (raw == (uint16_t)MODBUS_CO2_CTRL_MODE_AUTO) {
+    return MODBUS_CO2_CTRL_MODE_AUTO;
+  }
+  return MODBUS_CO2_CTRL_MODE_OFF;
+}
+
+uint16_t modbus_get_co2_manual_outputs(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MANUAL_OUTPUTS);
+}
+
+uint16_t modbus_get_co2_schedule_start_hhmm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_SCHEDULE_START_HHMM);
+}
+
+uint16_t modbus_get_co2_schedule_end_hhmm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_SCHEDULE_END_HHMM);
+}
+
+uint16_t modbus_get_co2_low_light_threshold_wm2(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_LOW_LIGHT_THRESHOLD_WM2);
+}
+
+uint16_t modbus_get_co2_mid_light_threshold_wm2(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MID_LIGHT_THRESHOLD_WM2);
+}
+
+uint16_t modbus_get_co2_high_light_threshold_wm2(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_HIGH_LIGHT_THRESHOLD_WM2);
+}
+
+uint16_t modbus_get_co2_low_light_target_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_LOW_LIGHT_TARGET_PPM);
+}
+
+uint16_t modbus_get_co2_mid_light_target_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MID_LIGHT_TARGET_PPM);
+}
+
+uint16_t modbus_get_co2_high_light_target_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_HIGH_LIGHT_TARGET_PPM);
+}
+
+static uint16_t modbus_get_co2_percent_reg(uint16_t reg_index) {
+  uint16_t raw = modbus_read_holding_reg(reg_index);
+  if (raw > 1000U) {
+    raw = 1000U;
+  }
+  return (uint16_t)(raw / 10U);
+}
+
+uint16_t modbus_get_co2_vent_limit_low_percent(void) {
+  return modbus_get_co2_percent_reg(MODBUS_HREG_CO2_VENT_LIMIT_LOW_PERCENT);
+}
+
+uint16_t modbus_get_co2_vent_limit_high_percent(void) {
+  return modbus_get_co2_percent_reg(MODBUS_HREG_CO2_VENT_LIMIT_HIGH_PERCENT);
+}
+
+uint16_t modbus_get_co2_vent_cutoff_percent(void) {
+  return modbus_get_co2_percent_reg(MODBUS_HREG_CO2_VENT_CUTOFF_PERCENT);
+}
+
+uint16_t modbus_get_co2_dosing_hysteresis_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_DOSING_HYST_PPM);
+}
+
+uint16_t modbus_get_co2_max_safe_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MAX_SAFE_PPM);
+}
+
+uint16_t modbus_get_co2_max_dosing_time_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MAX_DOSING_TIME_S);
+}
+
+uint16_t modbus_get_co2_min_pause_time_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_MIN_PAUSE_TIME_S);
+}
+
+uint16_t modbus_get_co2_no_rise_check_time_s(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_NO_RISE_CHECK_TIME_S);
+}
+
+uint16_t modbus_get_co2_no_rise_min_delta_ppm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_NO_RISE_MIN_DELTA_PPM);
+}
+
+float modbus_get_co2_temp_high_delta_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CO2_TEMP_HIGH_DELTA)) /
+         10.0f;
+}
+
+float modbus_get_co2_temp_critical_delta_c(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CO2_TEMP_CRITICAL_DELTA)) /
+         10.0f;
+}
+
+float modbus_get_co2_humidity_high_delta_percent(void) {
+  return ((float)modbus_read_holding_reg(MODBUS_HREG_CO2_HUM_HIGH_DELTA)) /
+         10.0f;
+}
+
+bool modbus_get_co2_external_alarm(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_EXTERNAL_ALARM) != 0U;
+}
+
+uint16_t modbus_get_co2_fault_reset_token(void) {
+  return modbus_read_holding_reg(MODBUS_HREG_CO2_FAULT_RESET_TOKEN);
+}
+
+void modbus_set_co2_runtime(uint16_t target_ppm, uint16_t effective_target_ppm,
+                            uint16_t status_bits, uint16_t reason_bits,
+                            uint16_t protection_bits, uint16_t fault_code,
+                            uint16_t dosing_elapsed_s) {
+  modbus_write_holding_reg(MODBUS_HREG_CO2_TARGET_PPM, target_ppm);
+  modbus_write_holding_reg(MODBUS_HREG_CO2_EFFECTIVE_TARGET_PPM,
+                           effective_target_ppm);
+  modbus_write_holding_reg(MODBUS_HREG_CO2_STATUS_BITS, status_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CO2_REASON_BITS, reason_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CO2_PROTECTION_BITS, protection_bits);
+  modbus_write_holding_reg(MODBUS_HREG_CO2_FAULT_CODE, fault_code);
+  modbus_write_holding_reg(MODBUS_HREG_CO2_DOSING_ELAPSED_S,
+                           dosing_elapsed_s);
 }
 
 modbus_mode_state_t modbus_get_mode_state(void) {

@@ -1,4 +1,5 @@
 #include "bt_ascii_control.h"
+#include "co2_controller.h"
 #include "ads1115.h"
 #include "curtain_controller.h"
 #include "driver/gpio.h"
@@ -79,6 +80,8 @@ static const char *TAG = "APP";
 #define HC595_BIT_HEATING_GROW_PUMP 13U
 #define HC595_BIT_CURTAIN_OPEN 14U
 #define HC595_BIT_CURTAIN_CLOSE 15U
+#define HC595_BIT_CO2_VALVE 16U
+#define HC595_BIT_CO2_RECIRC_FAN 17U
 
 // Window motor config
 #define WINDOW_A_NAME "window_a"
@@ -356,6 +359,7 @@ static bool s_rtc_available = false;
 static rll400_handle_t s_window_a_handle = NULL;
 static rll400_handle_t s_window_b_handle = NULL;
 static curtain_controller_handle_t s_curtain_handle = NULL;
+static co2_controller_handle_t s_co2_handle = NULL;
 static portMUX_TYPE s_sensor_lock = portMUX_INITIALIZER_UNLOCKED;
 static app_sensor_snapshot_t s_sensor_snapshot = {0};
 static window_pair_runtime_t s_window_runtime = {0};
@@ -888,6 +892,31 @@ static esp_err_t apply_heating_outputs(uint16_t pump_mask,
   }
   return hc595_outputs_write_masked(s_hc595_outputs, heating_all_outputs_mask(),
                                     value);
+}
+
+static uint32_t co2_output_mask(void) {
+  return (1UL << HC595_BIT_CO2_VALVE) | (1UL << HC595_BIT_CO2_RECIRC_FAN);
+}
+
+static esp_err_t apply_co2_outputs(bool valve_open, bool fan_on) {
+  if (s_hc595_outputs == NULL) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  uint32_t value = 0U;
+  if (valve_open) {
+    value |= (1UL << HC595_BIT_CO2_VALVE);
+  }
+  if (fan_on) {
+    value |= (1UL << HC595_BIT_CO2_RECIRC_FAN);
+  }
+  return hc595_outputs_write_masked(s_hc595_outputs, co2_output_mask(), value);
+}
+
+static esp_err_t init_co2_controller(void) {
+  co2_controller_config_t cfg = {
+      .name = "greenhouse_co2",
+  };
+  return co2_controller_init(&cfg, &s_co2_handle);
 }
 
 static esp_err_t init_heating_controllers(void) {
@@ -1646,6 +1675,138 @@ static void process_curtain(const app_sensor_snapshot_t *sensor_snapshot,
   }
 }
 
+static void process_co2(const app_sensor_snapshot_t *sensor_snapshot,
+                        float window_a_pos_percent,
+                        float window_b_pos_percent) {
+  if (s_co2_handle == NULL) {
+    return;
+  }
+
+  modbus_weather_runtime_t weather = {0};
+  modbus_get_weather_runtime(&weather);
+
+  ds3231_time_t now = {0};
+  bool time_valid = false;
+  if (s_rtc_available && rtc_handle != NULL &&
+      ds3231_get_time(rtc_handle, &now) == ESP_OK) {
+    time_valid = true;
+  } else {
+    const uint32_t sec_of_day =
+        (uint32_t)((esp_timer_get_time() / 1000000ULL) % 86400ULL);
+    now.hour = (uint8_t)((sec_of_day / 3600U) % 24U);
+    now.minute = (uint8_t)((sec_of_day % 3600U) / 60U);
+    now.second = (uint8_t)(sec_of_day % 60U);
+    time_valid = true;
+  }
+
+  const modbus_co2_ctrl_mode_t raw_mode = modbus_get_co2_ctrl_mode();
+  co2_controller_mode_t mode = CO2_CONTROLLER_MODE_OFF;
+  if (raw_mode == MODBUS_CO2_CTRL_MODE_AUTO) {
+    mode = CO2_CONTROLLER_MODE_AUTO;
+  } else if (raw_mode == MODBUS_CO2_CTRL_MODE_MANUAL) {
+    mode = CO2_CONTROLLER_MODE_MANUAL;
+  }
+
+  const uint16_t manual_outputs = modbus_get_co2_manual_outputs();
+  co2_controller_settings_t settings = {
+      .mode = mode,
+      .manual_valve_open = (manual_outputs & 0x01U) != 0U,
+      .manual_fan_on = (manual_outputs & 0x02U) != 0U,
+      .schedule_start_hhmm = modbus_get_co2_schedule_start_hhmm(),
+      .schedule_end_hhmm = modbus_get_co2_schedule_end_hhmm(),
+      .low_light_threshold_wm2 = modbus_get_co2_low_light_threshold_wm2(),
+      .mid_light_threshold_wm2 = modbus_get_co2_mid_light_threshold_wm2(),
+      .high_light_threshold_wm2 = modbus_get_co2_high_light_threshold_wm2(),
+      .low_light_target_ppm = modbus_get_co2_low_light_target_ppm(),
+      .mid_light_target_ppm = modbus_get_co2_mid_light_target_ppm(),
+      .high_light_target_ppm = modbus_get_co2_high_light_target_ppm(),
+      .ventilation_limit_low_percent =
+          modbus_get_co2_vent_limit_low_percent(),
+      .ventilation_limit_high_percent =
+          modbus_get_co2_vent_limit_high_percent(),
+      .ventilation_cutoff_percent = modbus_get_co2_vent_cutoff_percent(),
+      .dosing_hysteresis_ppm = modbus_get_co2_dosing_hysteresis_ppm(),
+      .max_safe_ppm = modbus_get_co2_max_safe_ppm(),
+      .max_dosing_time_s = modbus_get_co2_max_dosing_time_s(),
+      .min_pause_time_s = modbus_get_co2_min_pause_time_s(),
+      .no_rise_check_time_s = modbus_get_co2_no_rise_check_time_s(),
+      .no_rise_min_delta_ppm = modbus_get_co2_no_rise_min_delta_ppm(),
+      .temp_high_delta_c = modbus_get_co2_temp_high_delta_c(),
+      .temp_critical_delta_c = modbus_get_co2_temp_critical_delta_c(),
+      .humidity_high_delta_percent =
+          modbus_get_co2_humidity_high_delta_percent(),
+  };
+
+  if (settings.ventilation_limit_high_percent <
+      settings.ventilation_limit_low_percent) {
+    settings.ventilation_limit_high_percent = settings.ventilation_limit_low_percent;
+  }
+  if (settings.ventilation_cutoff_percent <
+      settings.ventilation_limit_high_percent) {
+    settings.ventilation_cutoff_percent = settings.ventilation_limit_high_percent;
+  }
+  if (settings.temp_critical_delta_c < settings.temp_high_delta_c) {
+    settings.temp_critical_delta_c = settings.temp_high_delta_c;
+  }
+
+  static uint16_t last_fault_reset_token = 0U;
+  const uint16_t reset_token = modbus_get_co2_fault_reset_token();
+  if (reset_token != 0U && reset_token != last_fault_reset_token) {
+    if (co2_controller_reset_fault(s_co2_handle) == ESP_OK) {
+      ESP_LOGI(TAG, "CO2 fault reset token accepted: %u",
+               (unsigned)reset_token);
+    }
+    last_fault_reset_token = reset_token;
+  }
+
+  co2_controller_inputs_t inputs = {
+      .hour = now.hour,
+      .minute = now.minute,
+      .second = now.second,
+      .time_valid = time_valid,
+      .co2_ppm = modbus_get_co2_measured_ppm(),
+      .co2_valid = modbus_get_co2_sensor_valid(),
+      .radiation_wm2 = weather.solar_radiation_wm2,
+      .radiation_valid = weather.valid && !weather.stale,
+      .air_temp_c = sensor_snapshot != NULL ? sensor_snapshot->temp_air : 0.0f,
+      .air_temp_valid =
+          sensor_snapshot != NULL && sensor_snapshot->temp_air_valid,
+      .air_temp_target_c = modbus_get_air_temp_target_c(),
+      .air_temp_target_valid = true,
+      .humidity_percent = sensor_snapshot != NULL ? sensor_snapshot->rh : 0.0f,
+      .humidity_valid = sensor_snapshot != NULL && sensor_snapshot->rh_valid,
+      .humidity_target_percent = modbus_get_air_hum_target_percent(),
+      .humidity_target_valid = true,
+      .window_a_percent = window_a_pos_percent,
+      .window_a_valid = s_window_a_handle != NULL,
+      .window_b_percent = window_b_pos_percent,
+      .window_b_valid = s_window_b_handle != NULL,
+      .ventilation_valid = s_window_a_handle != NULL && s_window_b_handle != NULL,
+      .external_safety_alarm = modbus_get_co2_external_alarm(),
+  };
+
+  const esp_err_t err = co2_controller_process(s_co2_handle, &settings, &inputs);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "CO2 processing failed: %s", esp_err_to_name(err));
+    (void)apply_co2_outputs(false, false);
+    return;
+  }
+
+  co2_controller_status_t status = {0};
+  if (co2_controller_get_status(s_co2_handle, &status) == ESP_OK) {
+    esp_err_t output_err = apply_co2_outputs(status.valve_open, status.fan_on);
+    if (output_err != ESP_OK) {
+      ESP_LOGW(TAG, "CO2 output write failed: %s", esp_err_to_name(output_err));
+      (void)apply_co2_outputs(false, false);
+    }
+    modbus_set_co2_runtime(status.target_ppm, status.effective_target_ppm,
+                           status.status_bits, status.reason_bits,
+                           status.active_protection_bits,
+                           (uint16_t)status.fault_code,
+                           status.dosing_elapsed_s);
+  }
+}
+
 static void control_task(void *arg) {
   (void)arg;
   ESP_LOGI(TAG, "Control task started (%ums)", (unsigned)CONTROL_LOOP_MS);
@@ -1662,6 +1823,7 @@ static void control_task(void *arg) {
     float curtain_pos_percent = 0.0f;
     process_windows(&sensors, &window_a_pos_percent, &window_b_pos_percent);
     process_curtain(&sensors, &curtain_pos_percent);
+    process_co2(&sensors, window_a_pos_percent, window_b_pos_percent);
 
     modbus_set_telemetry(sensors.temp_air, sensors.rh,
                          sensors.water_temp[HEATING_CONTOUR_RAIL],
@@ -1681,6 +1843,7 @@ static void configure_runtime_log_levels(void) {
   }
   esp_log_level_set("rll400", ESP_LOG_INFO);
   esp_log_level_set("curtain_controller", ESP_LOG_INFO);
+  esp_log_level_set("co2_controller", ESP_LOG_INFO);
 }
 
 static void worker_task(void *arg) {
@@ -1867,6 +2030,8 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(init_heating_controllers());
   ESP_ERROR_CHECK(apply_light_outputs(false, false));
+  ESP_ERROR_CHECK(init_co2_controller());
+  ESP_ERROR_CHECK(apply_co2_outputs(false, false));
   const esp_err_t window_err = init_window_controllers();
   if (window_err != ESP_OK) {
     ESP_LOGW(TAG, "Window controllers disabled: %s", esp_err_to_name(window_err));
