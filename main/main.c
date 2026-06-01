@@ -1140,10 +1140,14 @@ static esp_err_t init_window_controllers(void) {
 
   esp_err_t err = rll400_init(&window_a_cfg, &s_window_a_handle);
   if (err != ESP_OK) {
+    s_window_a_handle = NULL;
     return err;
   }
   err = rll400_init(&window_b_cfg, &s_window_b_handle);
   if (err != ESP_OK) {
+    (void)rll400_del(s_window_a_handle);
+    s_window_a_handle = NULL;
+    s_window_b_handle = NULL;
     return err;
   }
   return ESP_OK;
@@ -1863,7 +1867,10 @@ void app_main(void) {
 
   ESP_ERROR_CHECK(init_heating_controllers());
   ESP_ERROR_CHECK(apply_light_outputs(false, false));
-  ESP_ERROR_CHECK(init_window_controllers());
+  const esp_err_t window_err = init_window_controllers();
+  if (window_err != ESP_OK) {
+    ESP_LOGW(TAG, "Window controllers disabled: %s", esp_err_to_name(window_err));
+  }
   ESP_ERROR_CHECK(init_curtain_controller());
 
   xTaskCreate(control_task, "ctrl", 6144, NULL, 6, NULL);
